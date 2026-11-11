@@ -1,0 +1,20 @@
+[package]
+name = "documentashion"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "pnm", "tiff"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["platform-verifier"] }
+base64 = "0.22"
+ttf-parser = "0.25"
+# verSHion's icon set; "subset" compiles in only the icons the app names (src/ui/theme.rs).
+egui-phosphor = { version = "0.14", default-features = false, features = ["regular", "subset"] }
+# Secret Service (KWallet / GNOME Keyring) over pure-Rust D-Bus; no system dev headers needed.
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
+[profile.release]
+opt-level = 2
