@@ -8,6 +8,7 @@ mod review;
 mod secrets;
 mod services;
 mod ui;
+mod update;
 use eframe::egui;
 
 fn main() -> eframe::Result {

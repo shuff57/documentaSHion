@@ -4,11 +4,12 @@ use super::*;
 use crate::ui::kit::{Tier, ty};
 use egui::{Align2, Rect, Sense};
 
-const SECTIONS: [(&str, &str); 4] = [
+const SECTIONS: [(&str, &str); 5] = [
     (icon::USB, "Scanner"),
     (icon::SLIDERS_HORIZONTAL, "Cleanup & OCR"),
     (icon::SPARKLE, "AI provider"),
     (icon::SUN, "Appearance"),
+    (icon::DOWNLOAD_SIMPLE, "Updates"),
 ];
 const NAV_W: f32 = 220.0;
 
@@ -38,7 +39,8 @@ impl App {
                         0 => self.scanner_section(ui, ctx, busy),
                         1 => self.cleanup_section(ui),
                         2 => self.ai_section(ui, ctx),
-                        _ => self.appearance_section(ui, ctx),
+                        3 => self.appearance_section(ui, ctx),
+                        _ => self.updates_section(ui, ctx, busy),
                     }
                 });
             });
@@ -140,7 +142,7 @@ impl App {
         }
         ui.add_space(8.0);
         kit::field(ui, "Endpoint", &mut self.settings.endpoint, "https://…/v1", false);
-        kit::field(ui, "Vision model", &mut self.settings.model, "for example qwen2.5vl or gemma3", false);
+        self.model_picker(ui, ctx);
         if self.settings.needs_key() {
             ui.add_space(8.0);
             if kit::field(ui, "API key", &mut self.key, "Paste your key", true).changed() {
@@ -167,6 +169,85 @@ impl App {
         }
         ui.add_space(6.0);
         ui.label(kit::meta("AI actions send the selected page image and its text to this provider. Reading text locally never leaves the computer."));
+    }
+
+    /// A dropdown of the provider's vision models, with a refresh button and a typed fallback.
+    fn model_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let tag = format!("{}|{}", self.settings.provider, self.settings.endpoint);
+        let fetched = matches!(&self.models, Some((t, _)) if *t == tag);
+        kit::label(ui, "Vision model");
+        ui.horizontal(|ui| {
+            let shown = if self.settings.model.is_empty() { "Choose a model".to_string() } else { self.settings.model.clone() };
+            let list: Vec<String> = match &self.models {
+                Some((t, Ok(m))) if *t == tag => m.list.clone(),
+                _ => vec![],
+            };
+            let r = egui::ComboBox::from_id_salt("model").selected_text(shown).width(340.0).show_ui(ui, |ui| {
+                for m in &list {
+                    ui.selectable_value(&mut self.settings.model, m.clone(), m);
+                }
+                if list.is_empty() {
+                    ui.label(kit::meta(if self.model_job.is_some() { "Loading…" } else { "Press the refresh button to list models." }));
+                }
+            });
+            // Opening the list the first time asks the provider for it.
+            if r.response.clicked() && !fetched {
+                self.fetch_models(ctx);
+            }
+            ui.add_enabled_ui(self.model_job.is_none(), |ui| {
+                if kit::icon_button(ui, icon::ARROW_CLOCKWISE, 36.0, "Refresh the model list", false).clicked() {
+                    self.fetch_models(ctx);
+                }
+            });
+        });
+        match &self.models {
+            Some((t, Err(e))) if *t == tag => kit::note(ui, icon::WARNING, e, theme::amber()),
+            Some((t, Ok(m))) if *t == tag => {
+                let text = if m.vision {
+                    format!("{} models that accept images.", m.list.len())
+                } else {
+                    format!("{} models. This provider doesn't say which accept images, so pick a vision one.", m.list.len())
+                };
+                ui.label(kit::meta(text));
+            }
+            _ => {}
+        }
+        kit::field(ui, "Or type a model name", &mut self.settings.model, "for example qwen2.5vl or gemma3", false);
+    }
+
+    fn updates_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
+        ui.label(kit::heading("Updates", ty::SECTION));
+        ui.label(kit::body("Pulls the latest version from GitHub, rebuilds it and restarts the app."));
+        ui.add_space(8.0);
+        let built: String = update::BUILT.chars().take(7).collect();
+        ui.label(kit::meta(format!("Running version {built} · source {}", update::source().display())));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                if kit::secondary(ui, Some(icon::ARROW_CLOCKWISE), "Check for updates").clicked() {
+                    self.launch(ctx, |c| Event::Update(update::check(&c)));
+                }
+                if matches!(&self.update, Some(Ok(s)) if s.behind)
+                    && kit::primary(ui, Some(icon::DOWNLOAD_SIMPLE), "Update and restart").clicked()
+                {
+                    self.save();
+                    self.launch(ctx, |c| Event::Updated(update::apply(&c)));
+                }
+            });
+        });
+        match &self.update {
+            Some(Ok(s)) if s.behind => {
+                kit::note(ui, icon::DOWNLOAD_SIMPLE, "An update is available. Building takes a few minutes; the app restarts when it finishes.", theme::accent());
+                for c in s.changes.iter().take(8) {
+                    ui.label(kit::body(format!("•  {c}")));
+                }
+            }
+            Some(Ok(_)) => kit::note(ui, icon::CHECK, "You have the latest version.", theme::accent()),
+            Some(Err(e)) => kit::note(ui, icon::WARNING, e, theme::amber()),
+            None => {}
+        }
+        ui.add_space(6.0);
+        ui.label(kit::meta("Needs git and Rust (cargo) on this computer. Your projects and settings are kept."));
     }
 
     fn appearance_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

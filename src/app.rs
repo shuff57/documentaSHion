@@ -8,7 +8,7 @@ use crate::{
     model::*,
     secrets,
     services::{self, Prepared, Reading},
-    review,
+    review, update,
     ui::{kit, theme, theme::icon},
 };
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Stroke, StrokeKind, Vec2};
@@ -35,6 +35,10 @@ pub(crate) enum Event {
     },
     Text(String, Result<Reading, String>),
     Key(String, Result<KeyChange, String>),
+    Models(String, Result<services::Models, String>),
+    Update(Result<update::Status, String>),
+    /// The new version was installed and started; this copy should close.
+    Updated(Result<(), String>),
 }
 pub(crate) enum KeyChange {
     Loaded(Option<String>),
@@ -76,6 +80,10 @@ pub(crate) struct App {
     pub(crate) key_state: KeyState,
     pub(crate) ocr_status: Result<String, String>,
     pub(crate) devices: Vec<String>,
+    /// Models the current provider offers, with the provider they were fetched for.
+    pub(crate) models: Option<(String, Result<services::Models, String>)>,
+    pub(crate) update: Option<Result<update::Status, String>>,
+    pub(crate) model_job: Option<Receiver<Event>>,
     pub(crate) job: Option<Receiver<Event>>,
     /// Keychain calls get their own channel: a wallet unlock prompt must not block scanning.
     pub(crate) key_job: Option<Receiver<Event>>,
@@ -108,6 +116,9 @@ impl App {
             key_state: KeyState::None,
             ocr_status: services::ocr_status(),
             devices: vec![],
+            models: None,
+            update: None,
+            model_job: None,
             job: None,
             key_job: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -168,6 +179,21 @@ impl App {
             ctx.request_repaint();
         });
     }
+    /// Lists the provider's vision models in the background.
+    fn fetch_models(&mut self, ctx: &egui::Context) {
+        if self.model_job.is_some() {
+            return;
+        }
+        let (s, key) = (self.settings.clone(), self.key.clone());
+        let tag = format!("{}|{}", s.provider, s.endpoint);
+        let (tx, rx) = mpsc::channel();
+        self.model_job = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::Models(tag, services::models(&s, &key)));
+            ctx.request_repaint();
+        });
+    }
     fn load_key(&mut self, ctx: &egui::Context) {
         self.key.clear();
         self.key_state = KeyState::None;
@@ -214,6 +240,14 @@ impl App {
         });
     }
     fn poll(&mut self) {
+        match self.model_job.as_ref().map(|r| r.try_recv()) {
+            Some(Ok(e)) => {
+                self.model_job = None;
+                self.handle(e);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => self.model_job = None,
+            _ => {}
+        }
         match self.key_job.as_ref().map(|r| r.try_recv()) {
             Some(Ok(e)) => {
                 self.key_job = None;
@@ -245,6 +279,17 @@ impl App {
     }
     fn handle(&mut self, e: Event) {
         match e {
+            Event::Models(tag, r) => self.models = Some((tag, r)),
+            Event::Update(r) => {
+                self.status = match &r {
+                    Ok(s) if s.behind => "An update is available.".into(),
+                    Ok(_) => "You have the latest version.".into(),
+                    Err(e) => e.clone(),
+                };
+                self.update = Some(r);
+            }
+            Event::Updated(Ok(())) => std::process::exit(0),
+            Event::Updated(Err(e)) => self.status = e,
             Event::Devices(Ok(s)) => {
                 self.devices = s
                     .lines()

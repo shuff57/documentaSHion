@@ -13,7 +13,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
-pub fn process(mut cmd: Command, cancel: &AtomicBool) -> Result<String, String> {
+pub fn process(cmd: Command, cancel: &AtomicBool) -> Result<String, String> {
+    process_for(cmd, cancel, Duration::from_secs(300))
+}
+pub fn process_for(mut cmd: Command, cancel: &AtomicBool, limit: Duration) -> Result<String, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
@@ -32,7 +35,7 @@ pub fn process(mut cmd: Command, cancel: &AtomicBool) -> Result<String, String> 
     });
     let start = Instant::now();
     let status = loop {
-        if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(300) {
+        if cancel.load(Ordering::Relaxed) || start.elapsed() > limit {
             let _ = child.kill();
             let _ = child.wait();
             let _ = a.join();
@@ -305,6 +308,106 @@ pub fn ai(p: &Page, s: &Settings, key: &str, task: &str) -> Result<String, Strin
     .filter(|t| !t.trim().is_empty())
     .map(str::to_owned)
     .ok_or_else(|| "The model returned no text. Check that it accepts images.".into())
+}
+/// Models a provider offers. `vision` is false when the provider can't say which accept images,
+/// in which case every model is listed.
+pub struct Models {
+    pub list: Vec<String>,
+    pub vision: bool,
+}
+fn token_for(s: &Settings, key: &str) -> String {
+    if !key.is_empty() {
+        return key.into();
+    }
+    let env = match s.provider.as_str() {
+        "OpenRouter" => "OPENROUTER_API_KEY",
+        "Ollama Cloud" => "OLLAMA_API_KEY",
+        _ => "DOCUMENTASHION_AI_KEY",
+    };
+    std::env::var(env).unwrap_or_default()
+}
+/// Asks the provider which models it has, keeping those that accept images where it says so.
+pub fn models(s: &Settings, key: &str) -> Result<Models, String> {
+    let token = token_for(s, key);
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build()
+        .new_agent();
+    let get = |url: &str| -> Result<Value, String> {
+        let mut req = agent.get(url);
+        if !token.is_empty() {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        let body = req
+            .call()
+            .map_err(|e| format!("Couldn't reach {url}: {e}"))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| e.to_string())?;
+        serde_json::from_str(&body).map_err(|e| e.to_string())
+    };
+    let base = s.endpoint.trim_end_matches('/');
+    let mut list: Vec<String>;
+    let mut vision = true;
+    if s.provider == "Local Ollama" || s.provider == "Ollama Cloud" {
+        let root = base.trim_end_matches("/v1");
+        let tags = get(&format!("{root}/api/tags"))?;
+        let names: Vec<String> = tags["models"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        list = vec![];
+        for name in names {
+            let show = agent
+                .post(&format!("{root}/api/show"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", &format!("Bearer {token}"))
+                .send(json!({"model": name}).to_string().into_bytes())
+                .ok()
+                .and_then(|mut r| r.body_mut().read_to_string().ok())
+                .and_then(|b| serde_json::from_str::<Value>(&b).ok());
+            match show.as_ref().and_then(|v| v["capabilities"].as_array()) {
+                Some(c) => {
+                    if c.iter().any(|c| c == "vision") {
+                        list.push(name);
+                    }
+                }
+                None => {
+                    // An older server that doesn't report capabilities: list everything.
+                    vision = false;
+                    list.push(name);
+                }
+            }
+        }
+    } else {
+        let v = get(&format!("{base}/models"))?;
+        let items = v["data"].as_array().cloned().unwrap_or_default();
+        list = vec![];
+        for m in &items {
+            let Some(id) = m["id"].as_str() else { continue };
+            match m.pointer("/architecture/input_modalities").and_then(Value::as_array) {
+                Some(mods) => {
+                    if mods.iter().any(|x| x == "image") {
+                        list.push(id.to_owned());
+                    }
+                }
+                None => {
+                    vision = false;
+                    list.push(id.to_owned());
+                }
+            }
+        }
+        if !vision {
+            // Mixed or unknown: show everything rather than hide a usable model.
+            list = items.iter().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect();
+        }
+    }
+    list.sort();
+    list.dedup();
+    if list.is_empty() {
+        return Err("The provider listed no models with image input.".into());
+    }
+    Ok(Models { list, vision })
 }
 pub type Cancel = Arc<AtomicBool>;
 pub fn import_pdf(
