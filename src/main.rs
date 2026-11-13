@@ -1,7 +1,10 @@
 mod app;
+mod claude;
 mod diff;
 mod imaging;
+mod marking;
 mod model;
+mod pagecopy;
 mod pdf;
 mod preview;
 mod review;

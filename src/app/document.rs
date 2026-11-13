@@ -316,6 +316,7 @@ impl App {
                         self.selected = i;
                         self.texture = None;
                         self.proposal = None;
+                        self.pending = None;
                     }
                 }
             });
@@ -329,13 +330,16 @@ impl App {
         let mut redraw = true;
         let mut changed = false;
         // The floating tool pill.
-        let pill_w: f32 = 9.0 * 38.0 + 3.0 * 9.0 + 116.0 + 20.0;
+        let pill_w: f32 = 10.0 * 38.0 + 4.0 * 9.0 + 116.0 + 20.0;
         let pill = Rect::from_center_size(Pos2::new(tray.center().x, tray.top() + 16.0 + PILL_H / 2.0), Vec2::new(pill_w.min(tray.width() - 24.0), PILL_H));
         let page_area = Rect::from_min_max(Pos2::new(tray.left() + 20.0, pill.bottom() + 16.0), Pos2::new(tray.right() - 20.0, tray.bottom() - 46.0));
 
-        // The page itself.
+        // The page itself, and its rebuilt copy beside it.
         let p = &self.project.pages[self.selected];
         let key = p.render_key();
+        let copy = self.pending.clone().or_else(|| p.rebuild_current().cloned());
+        let has_copy = copy.is_some();
+        let copy = copy.filter(|_| self.side_by_side);
         if self.texture.as_ref().is_none_or(|(k, _)| k != &key) {
             match p.render_within(Some(2200)) {
                 Ok(img) => self.texture = Some((key.clone(), texture(ctx, &key, img))),
@@ -344,15 +348,42 @@ impl App {
         }
         if let Some((_, tex)) = &self.texture {
             let s = tex.size_vec2();
-            let fit = (page_area.width() / s.x).min(page_area.height() / s.y);
+            let gap = 18.0;
+            let across = if copy.is_some() { 2.0 } else { 1.0 };
+            let fit = ((page_area.width() - gap * (across - 1.0)) / across / s.x).min(page_area.height() / s.y);
             let size = s * fit * self.zoom;
+            let total = Vec2::new(size.x * across + gap * (across - 1.0), size.y);
+            let cache = &mut self.copy_cache;
+            let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]);
+            if let Some(o) = self.scroll_to.take() {
+                scroll = scroll.scroll_offset(o);
+            }
             ui.scope_builder(UiBuilder::new().max_rect(page_area), |ui| {
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                scroll.show(ui, |ui| {
                     let avail = ui.available_size();
-                    let (outer, _) = ui.allocate_exact_size(size.max(avail), Sense::hover());
-                    let r = Rect::from_center_size(outer.center(), size);
-                    ui.painter().add(paper_shadow(r, 10));
-                    ui.painter().image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    let (outer, _) = ui.allocate_exact_size(total.max(avail), Sense::hover());
+                    let both = Rect::from_center_size(outer.center(), total);
+                    let scan = Rect::from_min_size(both.min, size);
+                    ui.painter().add(paper_shadow(scan, 10));
+                    ui.painter().image(tex.id(), scan, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    if let Some(r) = &copy {
+                        let sheet = Rect::from_min_size(Pos2::new(scan.right() + gap, scan.top()), size);
+                        ui.painter().add(paper_shadow(sheet, 10));
+                        ui.painter().rect_filled(sheet, CornerRadius::same(2), Color32::WHITE);
+                        // Pointing at a part of the copy outlines the same place on the scan.
+                        if let Some(i) = crate::pagecopy::draw(ui, cache, r, sheet, &crate::pagecopy::key(r)) {
+                            let b = &r.blocks[i];
+                            ui.painter().rect_stroke(crate::pagecopy::block_rect(b, scan).expand(3.0), CornerRadius::same(3), Stroke::new(2.0, theme::accent()), StrokeKind::Outside);
+                            let tip = format!(
+                                "{} · {:.0}% sure\n{}",
+                                if b.handwritten { "Student's writing" } else { "Printed" },
+                                b.conf * 100.0,
+                                b.text
+                            );
+                            egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("copy-tip"), egui::PopupAnchor::Pointer)
+                                .show(|ui| ui.label(kit::meta(tip)));
+                        }
+                    }
                 });
             });
         }
@@ -406,6 +437,11 @@ impl App {
                             }
                             if kit::icon_button(ui, icon::TRASH, side, "Remove page · Restore brings it back", false).clicked() {
                                 tool = Some(Tool::Remove);
+                            }
+                            kit::tool_divider(ui, 36.0);
+                            let tip = if has_copy { "Show the rebuilt copy beside the scan" } else { "No rebuilt copy yet · use AI grade" };
+                            if ui.add_enabled_ui(has_copy, |ui| kit::icon_button(ui, icon::COLUMNS, side, tip, has_copy && self.side_by_side)).inner.clicked() {
+                                self.side_by_side = !self.side_by_side;
                             }
                             kit::tool_divider(ui, 36.0);
                             if kit::icon_button(ui, icon::MAGNIFYING_GLASS_MINUS, side, "Zoom out", false).clicked() {
@@ -548,6 +584,13 @@ impl App {
                 if kit::secondary(ui, Some(icon::SPARKLE), "AI correct").on_hover_text(format!("{} · {}", self.settings.provider, if self.settings.model.is_empty() { "no model set" } else { &self.settings.model })).clicked() {
                     task = Some("Correct");
                 }
+                let model = if self.settings.model.is_empty() { "no model set" } else { &self.settings.model };
+                if kit::secondary(ui, Some(icon::EXAM), "AI grade")
+                    .on_hover_text(format!("Rebuild the page as a digital copy, the student's writing typed out · {} · {model}", self.settings.provider))
+                    .clicked()
+                {
+                    task = Some("Grade");
+                }
                 if kit::tertiary(ui, Some(icon::PENCIL_SIMPLE_LINE), "Rewrite").on_hover_text("A clean rewritten version, kept separate from the source").clicked() {
                     task = Some("Rewrite");
                 }
@@ -562,9 +605,11 @@ impl App {
                     self.launch(ctx, move |c| Event::Text("OCR".into(), services::ocr(&p, &c)));
                 }
             }
+            Some("Grade") => self.grade(ctx),
             Some(t) => self.ai(ctx, t),
             None => {}
         }
+        self.grading(ui, ctx, busy);
         ui.add_space(6.0);
         let palette = review::Palette::new(theme::is_dark());
         let font = egui::FontId::new(ty::BODY, egui::FontFamily::Proportional);

@@ -16,5 +16,10 @@ ttf-parser = "0.25"
 egui-phosphor = { version = "0.14", default-features = false, features = ["regular", "subset"] }
 # Secret Service (KWallet / GNOME Keyring) over pure-Rust D-Bus; no system dev headers needed.
 keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
+# Equations on rebuilt pages: equaSHion's math tree, TeX-style layout and CPU rasterizer (no egui).
+# Pinned to a commit of its `main`; bump `rev` on purpose.
+equashion-math = { git = "https://github.com/shuff57/equaSHion", rev = "fed687c6b5af025a1afc3484d6b4b167ff0679dc" }
+equashion-layout = { git = "https://github.com/shuff57/equaSHion", rev = "fed687c6b5af025a1afc3484d6b4b167ff0679dc" }
+equashion-render = { git = "https://github.com/shuff57/equaSHion", rev = "fed687c6b5af025a1afc3484d6b4b167ff0679dc" }
 [profile.release]
 opt-level = 2

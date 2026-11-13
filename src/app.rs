@@ -1,6 +1,7 @@
 //! The application state, background work and the window shell: the dock on the left, the
 //! active screen, and the status toast. Screens live in `app/`.
 mod document;
+mod grading;
 mod library;
 mod settings;
 
@@ -36,6 +37,12 @@ pub(crate) enum Event {
     Text(String, Result<Reading, String>),
     Key(String, Result<KeyChange, String>),
     Models(String, Result<services::Models, String>),
+    /// A rebuilt copy of the page with this id, marked unless marking failed (the warning).
+    Rebuild(String, Result<(Rebuild, Option<String>), String>),
+    /// New marks for the copy of the page with this id.
+    Marks(String, Result<Grade, String>),
+    /// An answer key read from a page or file, for review.
+    AnswerKey(Result<Vec<KeyItem>, String>),
     Update(Result<update::Status, String>),
     /// The new version was installed and started; this copy should close.
     Updated(Result<(), String>),
@@ -95,6 +102,16 @@ pub(crate) struct App {
     pub(crate) removed: Vec<(usize, Page)>,
     pub(crate) texture: Option<(String, egui::TextureHandle)>,
     pub(crate) crop_open: bool,
+    /// A rebuilt copy of the selected page awaiting Accept or Reject.
+    pub(crate) pending: Option<Rebuild>,
+    /// Typeset equations and fitted sizes for drawing rebuilt pages.
+    pub(crate) copy_cache: crate::pagecopy::Cache,
+    /// Show the rebuilt copy beside the scan when there is one.
+    pub(crate) side_by_side: bool,
+    /// Scroll the tray to this offset on the next frame.
+    pub(crate) scroll_to: Option<Vec2>,
+    /// The answer key being typed or reviewed, as text, before it is saved.
+    pub(crate) key_draft: Option<String>,
 }
 impl App {
     /// `secrets`: look up a saved API key at start (off for headless previews).
@@ -128,6 +145,11 @@ impl App {
             removed: vec![],
             texture: None,
             crop_open: false,
+            pending: None,
+            copy_cache: Default::default(),
+            side_by_side: true,
+            scroll_to: None,
+            key_draft: None,
         };
         if secrets {
             app.load_key(ctx);
@@ -214,6 +236,34 @@ impl App {
             });
         }
     }
+    /// Rebuilds the selected page as a digital copy and marks it, in the background.
+    fn grade(&mut self, ctx: &egui::Context) {
+        if let Some(p) = self.project.pages.get(self.selected).cloned() {
+            let (s, api, key) = (self.settings.clone(), self.key.clone(), self.project.key.clone());
+            self.launch(ctx, move |c| {
+                let r = services::rebuild(&p, &s, &api, &c).map(|mut r| {
+                    if c.load(Ordering::Relaxed) {
+                        return (r, None);
+                    }
+                    match crate::marking::mark(&p, &r, &key, &s, &api) {
+                        Ok(g) => {
+                            r.grade = Some(g);
+                            (r, None)
+                        }
+                        Err(e) => (r, Some(format!("Not marked: {e}"))),
+                    }
+                });
+                Event::Rebuild(p.id.clone(), r)
+            });
+        }
+    }
+    /// Marks the selected page's copy again, for example after the key changed.
+    fn remark(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.project.pages.get(self.selected).cloned() else { return };
+        let Some(r) = self.pending.clone().or_else(|| p.rebuild_current().cloned()) else { return };
+        let (s, api, key) = (self.settings.clone(), self.key.clone(), self.project.key.clone());
+        self.launch(ctx, move |_| Event::Marks(p.id.clone(), crate::marking::mark(&p, &r, &key, &s, &api)));
+    }
     /// Adds pages in the background so image analysis doesn't freeze the window.
     fn add_pages(
         &mut self,
@@ -280,6 +330,45 @@ impl App {
     fn handle(&mut self, e: Event) {
         match e {
             Event::Models(tag, r) => self.models = Some((tag, r)),
+            Event::Rebuild(id, Ok((r, warning))) => {
+                if self.project.pages.get(self.selected).is_some_and(|p| p.id == id) {
+                    let unsure = r.unsure() + r.grade.as_ref().map_or(0, Grade::unsure);
+                    let score = r.grade.as_ref().map(|g| {
+                        let (s, m) = g.score();
+                        format!(" · {} / {}", points(s), points(m))
+                    });
+                    self.status = format!(
+                        "Page rebuilt{}{}",
+                        score.unwrap_or_else(|| format!(" · {} parts", r.blocks.len())),
+                        if unsure > 0 { format!(" · {unsure} to check") } else { String::new() }
+                    );
+                    if let Some(w) = warning {
+                        self.status = format!("{} · {w}", self.status);
+                    }
+                    self.pending = Some(r);
+                    self.side_by_side = true;
+                } else {
+                    self.status = "Rebuilt a page that is no longer selected; discarded.".into();
+                }
+            }
+            Event::Marks(id, Ok(g)) => {
+                let page = self.project.pages.get(self.selected).filter(|p| p.id == id);
+                let copy = self.pending.clone().or_else(|| page.and_then(Page::rebuild_current).cloned());
+                match (page, copy) {
+                    (Some(_), Some(mut r)) => {
+                        let (s, m) = g.score();
+                        self.status = format!("Marked · {} / {} · Accept to keep the new marks", points(s), points(m));
+                        r.grade = Some(g);
+                        self.pending = Some(r);
+                    }
+                    _ => self.status = "Marked a page that is no longer selected; discarded.".into(),
+                }
+            }
+            Event::AnswerKey(Ok(items)) => {
+                self.status = format!("Answer key read · {} questions · check it, then save", items.len());
+                self.key_draft = Some(crate::marking::format_key(&items));
+            }
+            Event::Rebuild(_, Err(e)) | Event::Marks(_, Err(e)) | Event::AnswerKey(Err(e)) => self.status = e,
             Event::Update(r) => {
                 self.status = match &r {
                     Ok(s) if s.behind => "An update is available.".into(),
@@ -381,6 +470,7 @@ impl App {
         self.texture = None;
         self.thumbs.clear();
         self.proposal = None;
+        self.pending = None;
     }
     fn restore(&mut self) {
         if self.removed.is_empty() {

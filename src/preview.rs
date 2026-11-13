@@ -21,6 +21,10 @@ pub fn render(path: &str) {
             view: None,
         });
     }
+    // A rebuilt copy of the selected page (JSON of `Rebuild`), shown beside the scan.
+    if let Ok(path) = std::env::var("DOCUMENTASHION_PREVIEW_REBUILD") {
+        app.pending = Some(serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap());
+    }
     if std::env::var_os("DOCUMENTASHION_PREVIEW_DARK").is_some() {
         app.settings.dark = true;
         crate::ui::theme::set_dark(true, &ctx);
@@ -35,6 +39,13 @@ pub fn render(path: &str) {
             _ => crate::app::Screen::Document,
         };
     }
+    if let Ok(z) = std::env::var("DOCUMENTASHION_PREVIEW_ZOOM") {
+        app.zoom = z.parse().unwrap_or(1.0);
+    }
+    if let Ok(xy) = std::env::var("DOCUMENTASHION_PREVIEW_SCROLL") {
+        let v: Vec<f32> = xy.split(',').filter_map(|n| n.parse().ok()).collect();
+        app.scroll_to = Some(egui::vec2(v[0], v[1]));
+    }
     if std::env::var_os("DOCUMENTASHION_PREVIEW_CROP").is_some() {
         app.crop_open = true;
     }
@@ -43,7 +54,10 @@ pub fn render(path: &str) {
     }
     let mut textures = std::collections::HashMap::new();
     let mut last = None;
+    let scroll = app.scroll_to;
     for pass in 0..4 {
+        // Re-applied each pass: the first frame clamps it before the content is measured.
+        app.scroll_to = scroll;
         let mut out = ctx.run_ui(
             egui::RawInput {
                 time: Some(1.0 + pass as f64 * 0.3),

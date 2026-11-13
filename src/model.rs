@@ -33,6 +33,133 @@ pub struct Word {
     /// x, y, width, height.
     pub bbox: [u32; 4],
 }
+/// One element of a rebuilt page: a run of printed text or of the student's writing, where it
+/// sits on the scan. Math inside `text` is LaTeX between `$…$` (inline) or `$$…$$` (display).
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct Block {
+    /// x, y, width, height in thousandths of the rendered page.
+    pub bbox: [f32; 4],
+    /// The student wrote it (drawn in the answer colour), rather than it being printed.
+    #[serde(default)]
+    pub handwritten: bool,
+    pub text: String,
+    /// Height of one line of text, thousandths of the page height; 0 when the model gave none.
+    #[serde(default)]
+    pub line: f32,
+    /// How sure the model is of its reading, 0–1.
+    #[serde(default = "sure")]
+    pub conf: f32,
+}
+fn sure() -> f32 {
+    1.0
+}
+/// A digital copy of a page: its elements in place, with handwriting as typed text and math.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct Rebuild {
+    pub blocks: Vec<Block>,
+    /// `Page::geometry()` it was made on; positions are stale if the page was turned or cropped since.
+    pub geometry: String,
+    /// The model that produced it.
+    #[serde(default)]
+    pub model: String,
+    /// Positions were lined up with Tesseract's reading of the page; otherwise they are the
+    /// model's estimate.
+    #[serde(default)]
+    pub anchored: bool,
+    /// Suggested marks for the student's answers, once marked.
+    #[serde(default)]
+    pub grade: Option<Grade>,
+}
+impl Rebuild {
+    /// Blocks below this confidence are flagged for checking.
+    pub const UNSURE: f32 = 0.6;
+    pub fn unsure(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|b| b.conf < Self::UNSURE || b.text.contains("[unclear]"))
+            .count()
+    }
+}
+fn one() -> f32 {
+    1.0
+}
+/// One question of an answer key.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct KeyItem {
+    /// The question's label as printed: "3", "4b".
+    pub question: String,
+    /// The expected answer; math as LaTeX in `$…$`.
+    pub answer: String,
+    #[serde(default = "one")]
+    pub points: f32,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Right,
+    Partial,
+    #[default]
+    Wrong,
+    /// Nothing written.
+    Blank,
+}
+/// A suggested mark for one question.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct Mark {
+    pub question: String,
+    /// The student's answer, as read.
+    #[serde(default)]
+    pub answer: String,
+    /// The answer from the key, or the model's own solution when there is no key.
+    #[serde(default)]
+    pub expected: String,
+    pub verdict: Verdict,
+    pub points: f32,
+    pub max: f32,
+    /// How sure the model is of the mark, 0–1.
+    #[serde(default = "sure")]
+    pub conf: f32,
+    /// A short reason, for the teacher.
+    #[serde(default)]
+    pub note: String,
+    /// The rebuild's blocks holding the student's answer: where the mark is drawn.
+    #[serde(default)]
+    pub blocks: Vec<usize>,
+    /// The teacher changed the suggested mark.
+    #[serde(default)]
+    pub overridden: bool,
+}
+impl Mark {
+    /// Marks below this confidence are flagged for checking.
+    pub const UNSURE: f32 = 0.6;
+    pub fn unsure(&self) -> bool {
+        !self.overridden && self.conf < Self::UNSURE
+    }
+}
+/// Suggested marks for a page.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct Grade {
+    pub marks: Vec<Mark>,
+    /// There was no answer key: the model solved the questions itself.
+    #[serde(default)]
+    pub solved: bool,
+    #[serde(default)]
+    pub model: String,
+}
+impl Grade {
+    /// Points scored and points possible.
+    pub fn score(&self) -> (f32, f32) {
+        self.marks.iter().fold((0.0, 0.0), |(s, m), k| (s + k.points, m + k.max))
+    }
+    pub fn unsure(&self) -> usize {
+        self.marks.iter().filter(|m| m.unsure()).count()
+    }
+}
+/// A score as text, without needless decimals: "7.5 / 10".
+pub fn points(v: f32) -> String {
+    let r = (v * 100.0).round() / 100.0;
+    if r.fract() == 0.0 { format!("{r:.0}") } else { format!("{r}") }
+}
 /// Page state that undo restores. Older projects stored a `(text, rewrite, rotation, clean)` tuple.
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 #[serde(from = "SnapshotRepr")]
@@ -43,6 +170,7 @@ pub struct Snapshot {
     pub clean: bool,
     pub straighten: bool,
     pub crop: [f32; 4],
+    pub rebuild: Option<Rebuild>,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -57,6 +185,8 @@ enum SnapshotRepr {
         straighten: bool,
         #[serde(default)]
         crop: [f32; 4],
+        #[serde(default)]
+        rebuild: Option<Rebuild>,
     },
 }
 impl From<SnapshotRepr> for Snapshot {
@@ -76,6 +206,7 @@ impl From<SnapshotRepr> for Snapshot {
                 clean,
                 straighten,
                 crop,
+                rebuild,
             } => Self {
                 text,
                 rewrite,
@@ -83,6 +214,7 @@ impl From<SnapshotRepr> for Snapshot {
                 clean,
                 straighten,
                 crop,
+                rebuild,
             },
         }
     }
@@ -116,6 +248,9 @@ pub struct Page {
     /// `geometry()` when `words` were measured; boxes are stale if it changed.
     #[serde(default)]
     pub words_geometry: String,
+    /// The accepted rebuilt copy of the page, if any.
+    #[serde(default)]
+    pub rebuild: Option<Rebuild>,
     pub history: Vec<Snapshot>,
 }
 impl Page {
@@ -127,6 +262,7 @@ impl Page {
             clean: self.clean,
             straighten: self.straighten,
             crop: self.crop,
+            rebuild: self.rebuild.clone(),
         }
     }
     pub fn checkpoint(&mut self) {
@@ -150,7 +286,12 @@ impl Page {
             self.clean = s.clean;
             self.straighten = s.straighten;
             self.crop = s.crop;
+            self.rebuild = s.rebuild;
         }
+    }
+    /// The accepted rebuild, when it still lines up with the page as rendered now.
+    pub fn rebuild_current(&self) -> Option<&Rebuild> {
+        self.rebuild.as_ref().filter(|r| r.geometry == self.geometry())
     }
     /// Identifies the rendered pixel grid; OCR boxes are only valid for the geometry they were measured on.
     pub fn geometry(&self) -> String {
@@ -208,6 +349,9 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub pages: Vec<Page>,
+    /// The answer key AI grade marks against; empty means the model solves the questions.
+    #[serde(default)]
+    pub key: Vec<KeyItem>,
 }
 impl Project {
     pub fn new() -> Self {
@@ -215,6 +359,7 @@ impl Project {
             id: id(),
             name: "Untitled scan".into(),
             pages: vec![],
+            key: vec![],
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -309,7 +454,8 @@ impl Settings {
         .map_err(|e| e.to_string())
     }
     pub fn needs_key(&self) -> bool {
-        self.provider != "Local Ollama"
+        // Claude uses the Claude CLI's own sign-in.
+        self.provider != "Local Ollama" && self.provider != "Claude"
     }
     /// Keychain account for the current provider. Custom endpoints get one key each.
     pub fn key_account(&self) -> String {
@@ -349,6 +495,7 @@ mod tests {
         let p = Project {
             id: "fixture".into(),
             name: "Algebra".into(),
+            key: vec![],
             pages: vec![Page {
                 image: "original.png".into(),
                 text: "2 + 2".into(),

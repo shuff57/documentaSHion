@@ -126,7 +126,13 @@ impl App {
         kit::segmented(
             ui,
             &mut provider,
-            &[("Local Ollama", "Ollama"), ("Ollama Cloud", "Ollama Cloud"), ("OpenRouter", "OpenRouter"), ("Custom", "Custom")],
+            &[
+                ("Local Ollama", "Ollama"),
+                ("Ollama Cloud", "Ollama Cloud"),
+                ("OpenRouter", "OpenRouter"),
+                ("Claude", "Claude"),
+                ("Custom", "Custom"),
+            ],
         );
         if provider != before {
             self.settings.provider = provider.to_string();
@@ -134,14 +140,22 @@ impl App {
                 "Local Ollama" => "http://127.0.0.1:11434",
                 "Ollama Cloud" => "https://ollama.com/v1",
                 "OpenRouter" => "https://openrouter.ai/api/v1",
+                "Claude" => "",
                 _ => "http://localhost:1234/v1",
             }
             .into();
-            self.settings.model.clear();
+            self.settings.model = if provider == "Claude" { "sonnet".into() } else { String::new() };
             self.load_key(ctx);
+            if provider == "Claude" {
+                self.fetch_models(ctx);
+            }
         }
         ui.add_space(8.0);
-        kit::field(ui, "Endpoint", &mut self.settings.endpoint, "https://…/v1", false);
+        if self.settings.provider == "Claude" {
+            self.claude_sign_in(ui, ctx);
+        } else {
+            kit::field(ui, "Endpoint", &mut self.settings.endpoint, "https://…/v1", false);
+        }
         self.model_picker(ui, ctx);
         if self.settings.needs_key() {
             ui.add_space(8.0);
@@ -169,6 +183,28 @@ impl App {
         }
         ui.add_space(6.0);
         ui.label(kit::meta("AI actions send the selected page image and its text to this provider. Reading text locally never leaves the computer."));
+    }
+
+    /// Claude needs no key: it uses the Claude CLI's sign-in, checked when the model list loads.
+    fn claude_sign_in(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(kit::body(
+            "Uses Claude Code's sign-in on this computer, so requests count toward your Claude plan's usage instead of needing an API key.",
+        ));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if kit::secondary(ui, Some(icon::KEY), "Sign in").clicked() {
+                self.status = match crate::claude::sign_in() {
+                    Ok(()) => "Finish signing in in the terminal and browser, then press the refresh button.".into(),
+                    Err(e) => e,
+                };
+            }
+            ui.add_enabled_ui(self.model_job.is_none(), |ui| {
+                if kit::tertiary(ui, Some(icon::ARROW_CLOCKWISE), "Check sign-in").clicked() {
+                    self.fetch_models(ctx);
+                }
+            });
+        });
+        ui.add_space(4.0);
     }
 
     /// A dropdown of the provider's vision models, with a refresh button and a typed fallback.
@@ -202,6 +238,9 @@ impl App {
         });
         match &self.models {
             Some((t, Err(e))) if *t == tag => kit::note(ui, icon::WARNING, e, theme::amber()),
+            Some((t, Ok(m))) if *t == tag && m.note.is_some() => {
+                kit::note(ui, icon::CHECK, m.note.as_deref().unwrap_or_default(), theme::accent());
+            }
             Some((t, Ok(m))) if *t == tag => {
                 let text = if m.vision {
                     format!("{} models that accept images.", m.list.len())
@@ -212,7 +251,12 @@ impl App {
             }
             _ => {}
         }
-        kit::field(ui, "Or type a model name", &mut self.settings.model, "for example qwen2.5vl or gemma3", false);
+        let hint = if self.settings.provider == "Claude" {
+            "sonnet, opus, or a full name such as claude-opus-5-5"
+        } else {
+            "for example qwen2.5vl or gemma3"
+        };
+        kit::field(ui, "Or type a model name", &mut self.settings.model, hint, false);
     }
 
     fn updates_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
