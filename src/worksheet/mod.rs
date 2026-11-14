@@ -12,6 +12,7 @@ pub mod extract;
 pub mod fit;
 pub mod graphs;
 pub mod orient;
+pub mod student;
 
 use serde::{Deserialize, Serialize};
 
@@ -263,6 +264,9 @@ pub struct Text {
     pub sup: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sub: bool,
+    /// Crossed out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strike: bool,
     /// Hex colour, `RRGGBB`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,

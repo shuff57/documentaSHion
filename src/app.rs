@@ -43,8 +43,9 @@ pub(crate) enum Event {
     Marks(String, Result<Grade, String>),
     /// An answer key read from a page or file, for review.
     AnswerKey(Result<Vec<KeyItem>, String>),
-    /// The page rebuilt as a Word document: where it was saved and how well it fits the scan.
-    Worksheet(Result<(std::path::PathBuf, String), String>),
+    /// The page rebuilt as a Word document: where it was saved, how well it fits the scan, and
+    /// the student's work typed out beside the scan when that was made.
+    Worksheet(Result<(std::path::PathBuf, String, Option<std::path::PathBuf>), String>),
     Update(Result<update::Status, String>),
     /// The new version was installed and started; this copy should close.
     Updated(Result<(), String>),
@@ -96,6 +97,10 @@ pub(crate) struct App {
     pub(crate) job: Option<Receiver<Event>>,
     /// Keychain calls get their own channel: a wallet unlock prompt must not block scanning.
     pub(crate) key_job: Option<Receiver<Event>>,
+    /// The Datalab key, for typing out the student's work (see [`crate::worksheet::student`]).
+    pub(crate) datalab_key: String,
+    pub(crate) datalab_state: KeyState,
+    pub(crate) datalab_job: Option<Receiver<Event>>,
     pub(crate) cancel: services::Cancel,
     pub(crate) proposal: Option<Proposal>,
     pub(crate) thumbs: std::collections::HashMap<String, egui::TextureHandle>,
@@ -140,6 +145,9 @@ impl App {
             model_job: None,
             job: None,
             key_job: None,
+            datalab_key: String::new(),
+            datalab_state: KeyState::None,
+            datalab_job: None,
             cancel: Arc::new(AtomicBool::new(false)),
             proposal: None,
             thumbs: Default::default(),
@@ -155,6 +163,7 @@ impl App {
         };
         if secrets {
             app.load_key(ctx);
+            app.datalab_keychain(ctx, |a| secrets::load(a).map(KeyChange::Loaded));
         }
         app
     }
@@ -196,6 +205,22 @@ impl App {
         let account = self.settings.key_account();
         let (tx, rx) = mpsc::channel();
         self.key_job = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = f(&account);
+            let _ = tx.send(Event::Key(account, r));
+            ctx.request_repaint();
+        });
+    }
+    /// [`Self::keychain`] for the Datalab key, on its own channel.
+    pub(crate) fn datalab_keychain(&mut self, ctx: &egui::Context, f: impl FnOnce(&str) -> Result<KeyChange, String> + Send + 'static) {
+        if self.datalab_job.is_some() {
+            self.status = "Still waiting for the keychain. Check for an unlock prompt.".into();
+            return;
+        }
+        let account = crate::worksheet::student::ACCOUNT.to_string();
+        let (tx, rx) = mpsc::channel();
+        self.datalab_job = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = f(&account);
@@ -265,12 +290,15 @@ impl App {
         let Some(n) = (!self.project.pages.is_empty()).then_some(self.selected) else { return };
         let p = self.project.pages[n].clone();
         let (s, key) = (self.settings.clone(), self.key.clone());
+        let work_key = Some(self.datalab_key.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("DATALAB_API_KEY").ok().filter(|k| !k.trim().is_empty()));
         let dir = self.project.dir();
         let name: String = self.project.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
         let out = dir.join(format!("{} - page {}.docx", name.trim(), n + 1));
         self.launch(ctx, move |stop| {
-            let r = crate::worksheet::cli::rebuild_page(&p, &dir, &out, &s, &key, &stop);
-            Event::Worksheet(r.map(|r| (out.clone(), r.to_string())))
+            let r = crate::worksheet::cli::rebuild_page(&p, &dir, &out, &s, &key, work_key.as_deref(), &stop);
+            Event::Worksheet(r.map(|r| (out.clone(), r.to_string(), r.work.and_then(Result::ok).map(|w| w.0))))
         });
     }
     /// Marks the selected page's copy again, for example after the key changed.
@@ -312,6 +340,14 @@ impl App {
                 self.handle(e);
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => self.model_job = None,
+            _ => {}
+        }
+        match self.datalab_job.as_ref().map(|r| r.try_recv()) {
+            Some(Ok(e)) => {
+                self.datalab_job = None;
+                self.handle(e);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => self.datalab_job = None,
             _ => {}
         }
         match self.key_job.as_ref().map(|r| r.try_recv()) {
@@ -393,9 +429,12 @@ impl App {
                 };
                 self.update = Some(r);
             }
-            Event::Worksheet(Ok((path, report))) => {
+            Event::Worksheet(Ok((path, report, work))) => {
                 self.status = format!("Word copy saved: {} · {report}", path.display());
                 open_document(&path);
+                if let Some(w) = work {
+                    open_document(&w);
+                }
             }
             Event::Worksheet(Err(e)) => self.status = format!("No Word copy: {e}"),
             Event::Updated(Ok(())) => std::process::exit(0),
@@ -458,6 +497,26 @@ impl App {
                 });
                 self.status = "Suggestion ready · Review the highlighted words before accepting".into();
             }
+            Event::Key(account, r) if account == crate::worksheet::student::ACCOUNT => match r {
+                Ok(KeyChange::Loaded(Some(k))) => {
+                    self.datalab_key = k;
+                    self.datalab_state = KeyState::Saved;
+                }
+                Ok(KeyChange::Loaded(None)) => {}
+                Ok(KeyChange::Stored) => {
+                    self.datalab_state = KeyState::Saved;
+                    self.status = "Datalab key saved to the system keychain".into();
+                }
+                Ok(KeyChange::Forgotten) => {
+                    self.datalab_key.clear();
+                    self.datalab_state = KeyState::None;
+                    self.status = "Datalab key removed from the keychain".into();
+                }
+                Err(e) => {
+                    self.status = e.clone();
+                    self.datalab_state = KeyState::Unavailable(e);
+                }
+            },
             Event::Key(account, Ok(change)) if account == self.settings.key_account() => {
                 match change {
                     KeyChange::Loaded(Some(k)) => {

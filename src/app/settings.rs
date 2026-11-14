@@ -183,6 +183,42 @@ impl App {
         }
         ui.add_space(6.0);
         ui.label(kit::meta("AI actions send the selected page image and its text to this provider. Reading text locally never leaves the computer."));
+        self.student_work_settings(ui, ctx);
+    }
+
+    /// The Datalab key: with it, a Word copy also types out the student's work beside the scan.
+    fn student_work_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(18.0);
+        ui.label(kit::heading("Student work", ty::SECTION));
+        ui.label(kit::body(
+            "With a Datalab key, each Word copy also comes with the student's work typed out, question by question, beside the same part of the scan. Datalab's Chandra reads the handwriting, math, tables and graphs.",
+        ));
+        ui.add_space(8.0);
+        if kit::field(ui, "Datalab API key", &mut self.datalab_key, "Paste your key from datalab.to", true).changed() {
+            self.datalab_state = KeyState::Typed;
+        }
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.datalab_job.is_none(), |ui| {
+                if ui.add_enabled_ui(!self.datalab_key.trim().is_empty(), |ui| kit::secondary(ui, Some(icon::LOCK_SIMPLE), "Save to keychain")).inner.clicked() {
+                    let key = self.datalab_key.trim().to_owned();
+                    self.datalab_keychain(ctx, move |a| secrets::store(a, &key).map(|_| KeyChange::Stored));
+                }
+                if kit::tertiary(ui, Some(icon::TRASH), "Forget saved key").clicked() {
+                    self.datalab_keychain(ctx, |a| secrets::forget(a).map(|_| KeyChange::Forgotten));
+                }
+            });
+        });
+        let (glyph, tone, text) = match &self.datalab_state {
+            KeyState::Saved => (icon::LOCK_SIMPLE, theme::accent(), "Saved in the system keychain. Word copies include the student's work.".to_string()),
+            KeyState::Typed => (icon::KEY, theme::amber(), "Used for this session only until you save it to the keychain.".to_string()),
+            KeyState::None => (icon::KEY, theme::muted(), "No key saved: Word copies are the printed worksheet only. DATALAB_API_KEY also works.".to_string()),
+            KeyState::Unavailable(e) => (icon::WARNING, theme::amber(), e.clone()),
+        };
+        kit::note(ui, glyph, &text, tone);
+        ui.add_space(6.0);
+        ui.label(kit::meta(
+            "The page is sent to Datalab with the line the student's name is written on blanked out, and deleted from Datalab as soon as the reading is back. Datalab doesn't train on it unless your account opts in.",
+        ));
     }
 
     /// Claude needs no key: it uses the Claude CLI's sign-in, checked when the model list loads.

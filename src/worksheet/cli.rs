@@ -9,9 +9,13 @@
 //! documentashion ws review  <scan.png> <sheet.json>                   a second look for missing print
 //! documentashion ws graphs  <scan.png> <sheet.json> [--shear S] [--only check|score]
 //!                                                 read each graph again, close up, and check it
+//! documentashion ws work    <scan.png> <sheet.json> <out.docx> [--shear S] [--dry-run]
+//!                                                 the student's work typed out beside the scan
+//!                                                 (needs DATALAB_API_KEY or a key saved in the app)
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
 //! documentashion ws page    <project id> <page n> [out.docx]            a project's page, as the app does it
 //! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
+//!                                                 (and the student's work, with a Datalab key)
 //! ```
 use super::*;
 use std::{
@@ -19,7 +23,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|review|graphs|upright|page|rebuild …";
+const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|review|graphs|work|upright|page|rebuild …";
 
 pub fn main(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -29,6 +33,8 @@ pub fn main(args: &[String]) -> Result<(), String> {
         for a in args {
             if skip {
                 skip = false;
+            } else if a == "--dry-run" {
+                // A switch: it takes no value.
             } else if a.starts_with("--") {
                 skip = true;
             } else {
@@ -64,6 +70,19 @@ pub fn main(args: &[String]) -> Result<(), String> {
             save(&sheet, path)
         }
         "upright" => upright(Path::new(arg(1)?), Path::new(arg(2)?)).map(|_| ()),
+        "work" => {
+            let sheet = load(Path::new(arg(2)?))?;
+            let shear = flag("--shear").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            // `--dry-run`: the page as it would be sent, name blanked, written as the output (a PNG).
+            if args.iter().any(|a| a == "--dry-run") {
+                let (page, _) = student::outgoing(Path::new(arg(1)?), &sheet, shear)?;
+                return page.save(arg(3)?).map_err(|e| e.to_string());
+            }
+            let key = student::key().ok_or("Set DATALAB_API_KEY, or save a Datalab key in the app's settings.")?;
+            let n = student::work(Path::new(arg(1)?), &sheet, shear, &key, Path::new(arg(3)?))?;
+            eprintln!("{n} pieces of the student's work");
+            Ok(())
+        }
         "review" => {
             let path = Path::new(arg(2)?);
             let mut sheet = load(path)?;
@@ -84,7 +103,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
                 return Err("This provider needs an API key: use the app.".into());
             }
             let stop = std::sync::atomic::AtomicBool::new(false);
-            rebuild_page(p, &dir, &out, &s, "", &stop).map(|r| eprintln!("{}: {r}", out.display()))
+            rebuild_page(p, &dir, &out, &s, "", student::key().as_deref(), &stop).map(|r| eprintln!("{}: {r}", out.display()))
         }
         "graphs" => {
             let path = Path::new(arg(2)?);
@@ -105,7 +124,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
         "rebuild" => {
             let out = Path::new(arg(2)?);
             let stop = std::sync::atomic::AtomicBool::new(false);
-            rebuild(Path::new(arg(1)?), out, ask, true, &stop).map(|r| eprintln!("{}: {r}", out.display()))
+            rebuild(Path::new(arg(1)?), out, ask, true, student::key().as_deref(), &stop).map(|r| eprintln!("{}: {r}", out.display()))
         }
         _ => Err(USAGE.into()),
     }
@@ -121,8 +140,10 @@ pub fn upright(scan: &Path, out: &Path) -> Result<u8, String> {
 
 /// The whole rebuild of one scanned page: turned upright when `turn` (kept beside `out` as
 /// `<name>.scan.png`), read, fitted to the scan and written as `out`; the worksheet itself is
-/// kept as `<name>.json`. `stop` cancels it between steps. Returns how well it fits.
-pub fn rebuild(scan: &Path, out: &Path, ask: Ask, turn: bool, stop: &std::sync::atomic::AtomicBool) -> Result<fit::Report, String> {
+/// kept as `<name>.json`. With a Datalab key (`work_key`) the student's work is typed out beside
+/// the scan too, as `<name>.work.docx` (see [`student`]). `stop` cancels it between steps.
+/// Returns how well it fits, and how the student's work went when it was asked for.
+pub fn rebuild(scan: &Path, out: &Path, ask: Ask, turn: bool, work_key: Option<&str>, stop: &std::sync::atomic::AtomicBool) -> Result<Rebuilt, String> {
     let stopped = || -> Result<(), String> {
         if stop.load(std::sync::atomic::Ordering::Relaxed) { Err("Stopped.".into()) } else { Ok(()) }
     };
@@ -177,7 +198,31 @@ pub fn rebuild(scan: &Path, out: &Path, ask: Ask, turn: bool, stop: &std::sync::
         }
     }
     build(&sheet, out)?;
-    Ok(report)
+    let mut work = None;
+    if let Some(key) = work_key {
+        stopped()?;
+        let path = out.with_extension("work.docx");
+        // The worksheet itself is done; the student's work is extra, and its failure only noted.
+        work = Some(student::work(&page, &sheet, report.shear, key, &path).map(|n| (path, n)));
+    }
+    Ok(Rebuilt { report, work })
+}
+
+/// What [`rebuild`] made.
+pub struct Rebuilt {
+    pub report: fit::Report,
+    /// The student's work document and how many pieces it holds, when a Datalab key was given.
+    pub work: Option<Result<(PathBuf, usize), String>>,
+}
+impl std::fmt::Display for Rebuilt {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.report)?;
+        match &self.work {
+            Some(Ok((p, n))) => write!(f, "; the student's work ({n} pieces): {}", p.display()),
+            Some(Err(e)) => write!(f, "; no copy of the student's work: {e}"),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Rebuilds page `p` of a project as the app does: the page as it is shown (cropped and
@@ -189,12 +234,13 @@ pub fn rebuild_page(
     out: &Path,
     s: &crate::model::Settings,
     key: &str,
+    work_key: Option<&str>,
     stop: &std::sync::atomic::AtomicBool,
-) -> Result<fit::Report, String> {
+) -> Result<Rebuilt, String> {
     let scan = dir.join(format!("{}.worksheet.png", p.id));
     p.render()?.save(&scan).map_err(|e| e.to_string())?;
     let model = |prompt: &str, img: &str| crate::services::chat(s, key, prompt, img, true, std::time::Duration::from_secs(900));
-    let r = rebuild(&scan, out, &model, true, stop);
+    let r = rebuild(&scan, out, &model, true, work_key, stop);
     // The page images were only needed while rebuilding; the document and its worksheet stay.
     let _ = std::fs::remove_file(&scan);
     let _ = std::fs::remove_file(out.with_extension("scan.png"));

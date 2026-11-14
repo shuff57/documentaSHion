@@ -111,6 +111,8 @@ struct Probe {
     marks: Vec<Mark>,
     /// The words of the first page as the PDF holds them (see [`seed::pdf_words`]).
     words: Vec<seed::Word>,
+    /// The same words as printed, with their boxes (see [`word_boxes`]).
+    boxes: Vec<WordBox>,
     /// How many pages the sheet ran to.
     pages: usize,
     /// How far, points, what ran past the first page reaches down the page it ends on (with
@@ -134,6 +136,7 @@ fn probe(sheet: &Sheet) -> Result<Probe, String> {
     let first = text.split("</page>").next().unwrap_or("");
     let marks = parse_marks(first);
     let words = seed::pdf_words(first);
+    let boxes = word_boxes(first);
     let stem = docx.with_extension("");
     let page_png = |page: usize, dpi: u32, stem: &Path| -> Result<GrayImage, String> {
         let (dpi, n) = (dpi.to_string(), page.to_string());
@@ -160,7 +163,30 @@ fn probe(sheet: &Sheet) -> Result<Probe, String> {
         let body = sheet.page.height - top - bottom;
         spill = (pages - 2) as f32 * body + low.map(|y| y as f32 + 1.0 - top).unwrap_or(0.0).max(0.0);
     }
-    Ok(Probe { img, marks, words, pages, spill })
+    Ok(Probe { img, marks, words, boxes, pages, spill })
+}
+
+/// A printed word and its box: left, top, right, bottom, points from the page's top left.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordBox {
+    pub text: String,
+    pub rect: [f32; 4],
+}
+
+/// The words in one page of `pdftotext -bbox` output as printed, markers left out.
+fn word_boxes(xml: &str) -> Vec<WordBox> {
+    let attr = |line: &str, name: &str| -> Option<f32> {
+        let i = line.find(&format!("{name}=\""))? + name.len() + 2;
+        line[i..].split('"').next()?.parse().ok()
+    };
+    xml.lines()
+        .filter_map(|line| {
+            let rect = [attr(line, "xMin")?, attr(line, "yMin")?, attr(line, "xMax")?, attr(line, "yMax")?];
+            let text = line.split('>').nth(1)?.split('<').next()?;
+            let text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'");
+            (rect[3] - rect[1] >= 2.5 && !text.trim().is_empty()).then_some(WordBox { text, rect })
+        })
+        .collect()
 }
 
 /// Markers ([`docx::marker`]) in `pdftotext -bbox` output. A marker is set with no advance,
@@ -653,6 +679,8 @@ pub struct Measure {
     /// The sheet as drawn (the first page, 150 dpi) and the scan at the same size.
     pub render: GrayImage,
     pub scan: GrayImage,
+    /// The first page's printed words as drawn, points.
+    pub words: Vec<WordBox>,
 }
 
 /// The box of a figure drawn with marker `m`: an inline picture stands on the line's baseline,
@@ -678,7 +706,7 @@ fn cell_strip(render: &GrayImage, m: &Mark, size: f32, width: f32) -> Option<[u3
 }
 
 /// The width, points, of the cell a nested anchor sits in.
-fn cell_width(blocks: &[Block], path: &[usize]) -> Option<f32> {
+pub(super) fn cell_width(blocks: &[Block], path: &[usize]) -> Option<f32> {
     let (inner, cell) = (path.len() >= 4).then(|| (&path[..path.len() - 1], &path[path.len() - 3..path.len() - 1]))?;
     let table_path = &inner[..inner.len() - 2];
     let Block::Table(t) = super::block_at(blocks, table_path)? else { return None };
@@ -813,7 +841,7 @@ const PINNED: f32 = 6.0;
 fn measure_with(scan: &GrayImage, sheet: &Sheet, words: &[seed::Word]) -> Result<Measure, String> {
     let pr = probe(sheet)?;
     let by_words = if words.is_empty() { Default::default() } else { seed::offsets(&pr, sheet, words) };
-    let Probe { img: render, marks, pages, spill, .. } = pr;
+    let Probe { img: render, marks, pages, spill, boxes, .. } = pr;
     let scan_page = if scan.dimensions() == render.dimensions() {
         scan.clone()
     } else {
@@ -988,7 +1016,7 @@ fn measure_with(scan: &GrayImage, sheet: &Sheet, words: &[seed::Word]) -> Result
         drawn[i] = Some(strip);
     }
     let agreement = agreement(&render, &scan_page);
-    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, spill, head, foot, render, scan: scan_page })
+    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, spill, head, foot, render, scan: scan_page, words: boxes })
 }
 
 /// Letters and digits on a paragraph's first line (an equation counts about half its source).

@@ -371,6 +371,9 @@ fn rpr(t: &Text, sheet: &Sheet) -> String {
     if t.italic {
         s.push_str("<w:i/><w:iCs/>");
     }
+    if t.strike {
+        s.push_str("<w:strike/>");
+    }
     if t.underline {
         s.push_str(r#"<w:u w:val="single"/>"#);
     }
