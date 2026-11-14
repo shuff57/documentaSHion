@@ -8,6 +8,8 @@ use super::*;
 use image::{GrayImage, Luma, Rgb, RgbImage};
 use std::{path::Path, process::Command};
 
+mod seed;
+
 /// Pixels per point of the images compared (150 dpi).
 pub const K: f32 = 150.0 / 72.0;
 
@@ -102,9 +104,22 @@ struct Mark {
     y: f32,
 }
 
-/// Draws the sheet with markers; returns the first page's image at 150 dpi, its markers and how
-/// many pages the sheet ran to.
-fn probe(sheet: &Sheet) -> Result<(GrayImage, Vec<Mark>, usize), String> {
+/// The sheet as drawn for measuring.
+struct Probe {
+    /// The first page at 150 dpi.
+    img: GrayImage,
+    marks: Vec<Mark>,
+    /// The words of the first page as the PDF holds them (see [`seed::pdf_words`]).
+    words: Vec<seed::Word>,
+    /// How many pages the sheet ran to.
+    pages: usize,
+    /// How far, points, what ran past the first page reaches down the page it ends on (with
+    /// any full pages between): about how much room a one-page sheet must find.
+    spill: f32,
+}
+
+/// Draws the sheet with markers.
+fn probe(sheet: &Sheet) -> Result<Probe, String> {
     let docx = super::cli::tmp("probe.docx");
     docx::write_as(sheet, &docx, &super::cli::figure_png, true)?;
     let pdf = docx.with_extension("pdf");
@@ -118,19 +133,34 @@ fn probe(sheet: &Sheet) -> Result<(GrayImage, Vec<Mark>, usize), String> {
     // Markers of the first page only: coordinates start again on each page.
     let first = text.split("</page>").next().unwrap_or("");
     let marks = parse_marks(first);
+    let words = seed::pdf_words(first);
     let stem = docx.with_extension("");
-    let out = Command::new("pdftoppm")
-        .args(["-r", "150", "-gray", "-png", "-singlefile", "-f", "1", "-l", "1"])
-        .arg(&pdf)
-        .arg(&stem)
-        .output()
-        .map_err(|e| format!("pdftoppm: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("pdftoppm: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    let page_png = |page: usize, dpi: u32, stem: &Path| -> Result<GrayImage, String> {
+        let (dpi, n) = (dpi.to_string(), page.to_string());
+        let out = Command::new("pdftoppm")
+            .args(["-r", &dpi, "-gray", "-png", "-singlefile", "-f", &n, "-l", &n])
+            .arg(&pdf)
+            .arg(stem)
+            .output()
+            .map_err(|e| format!("pdftoppm: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("pdftoppm: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        let png = stem.with_extension("png");
+        Ok(image::open(&png).map_err(|e| format!("{}: {e}", png.display()))?.to_luma8())
+    };
+    let img = page_png(1, 150, &stem)?;
+    let mut spill = 0.0;
+    if pages > 1 {
+        // The lowest ink on the last page, between the margins (the header and footer repeat).
+        let last = page_png(pages, 72, &super::cli::tmp("probe-last"))?;
+        let [top, _, bottom, _] = sheet.page.margins;
+        let rows = (top.max(0.0) as u32)..((sheet.page.height - bottom).max(top) as u32).min(last.height());
+        let low = rows.filter(|&y| (0..last.width()).filter(|&x| last.get_pixel(x, y).0[0] < 128).count() >= 2).last();
+        let body = sheet.page.height - top - bottom;
+        spill = (pages - 2) as f32 * body + low.map(|y| y as f32 + 1.0 - top).unwrap_or(0.0).max(0.0);
     }
-    let png = stem.with_extension("png");
-    let img = image::open(&png).map_err(|e| format!("{}: {e}", png.display()))?.to_luma8();
-    Ok((img, marks, pages))
+    Ok(Probe { img, marks, words, pages, spill })
 }
 
 /// Markers ([`docx::marker`]) in `pdftotext -bbox` output. A marker is set with no advance,
@@ -612,11 +642,12 @@ pub struct Measure {
     /// Where each anchor's first line (a figure: its box) was drawn, pixels of the rendering;
     /// `None` for one with nothing to match (a spacer, an empty paragraph).
     pub drawn: Vec<Option<[u32; 4]>>,
-    /// The first header and footer anchor's offsets.
     /// How much of the rebuild's printed ink lands on ink in the scan (see [`agreement`]).
     pub agreement: f32,
-    /// Pages the sheet ran to as drawn.
+    /// Pages the sheet ran to as drawn, and how far it ran over (see [`Probe::spill`]).
     pub pages: usize,
+    pub spill: f32,
+    /// The first header and footer anchor's offsets.
     pub head: Option<Offset>,
     pub foot: Option<Offset>,
 }
@@ -754,9 +785,32 @@ fn figure_refine(render: &GrayImage, scan: &GrayImage, m: &Mark, strip: [u32; 4]
     (best.1, Offset { y: m.y, dy: best.3 as f32 / K, dx: best.2 as f32 / K, score: best.0, strip })
 }
 
+/// The run of blocks an anchor keeps its order in down the page: its list, with a table cell's
+/// row left out, so that each column of a table is one run from its top row to its bottom.
+fn run_of(path: &[usize]) -> Vec<usize> {
+    let mut v = path[..path.len() - 1].to_vec();
+    if v.len() >= 3 {
+        let n = v.len();
+        v[n - 2] = usize::MAX;
+    }
+    v
+}
+
 /// One measuring pass over the sheet as it stands.
 pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
-    let (render, marks, pages) = probe(sheet)?;
+    measure_with(scan, sheet, &[])
+}
+
+/// A line found among the scan's words with at least this much support (see [`seed`]) is
+/// where its words are, whatever its picture matches.
+const PINNED: f32 = 6.0;
+
+/// [`measure`], with the words read on the scan (see [`seed::scan_words`]): a line found among
+/// them is only looked for there.
+fn measure_with(scan: &GrayImage, sheet: &Sheet, words: &[seed::Word]) -> Result<Measure, String> {
+    let pr = probe(sheet)?;
+    let by_words = if words.is_empty() { Default::default() } else { seed::offsets(&pr, sheet, words) };
+    let Probe { img: render, marks, pages, spill, .. } = pr;
     let scan_page = if scan.dimensions() == render.dimensions() {
         scan.clone()
     } else {
@@ -781,15 +835,32 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             lines.push((m.index, m, strip));
         }
     }
-    // Candidate places for each, then the best consistent choice within each list of blocks
-    // (the body, each table cell): order down the page holds within a list, not across lists.
+    // Candidate places for each, then the best consistent choice within each run of blocks
+    // (the body, each table column, see `run_of`): order down the page holds within a run.
     // A drawn figure's lines are thinner or bolder than the print's: figures are compared
     // blurred, which lets a thin line and a thick one in the same place agree.
     let soft_render = image::imageops::blur(&render, 2.0);
     let soft_scan = image::imageops::blur(&scan_page, 2.0);
     let is_figure = |k: usize| matches!(super::block_at(&sheet.blocks, &anchors[lines[k].0]), Some(Block::Figure(_)));
+    let pinned = |k: usize| by_words.get(&anchors[lines[k].0]).filter(|_| !is_figure(k)).copied();
     let cands: Vec<Vec<Candidate>> = (0..lines.len())
-        .map(|k| if is_figure(k) { figure_candidates(&soft_render, &soft_scan, lines[k].2) } else { candidates(&render, &scan_page, lines[k].2) })
+        .map(|k| {
+            if is_figure(k) {
+                return figure_candidates(&soft_render, &soft_scan, lines[k].2);
+            }
+            let all = candidates(&render, &scan_page, lines[k].2);
+            // Found by its words: only near there, and there if its picture matches nowhere near.
+            match pinned(k) {
+                Some((dy, ..)) => {
+                    let mut near: Vec<Candidate> = all.iter().filter(|c| (c.dy as f32 / K - dy).abs() <= 5.0).copied().collect();
+                    if near.iter().all(|c| c.score < 0.5) {
+                        near.push(Candidate { dy: (dy * K).round() as i32, dx: 0, score: 0.5, scale: 1.0 });
+                    }
+                    near
+                }
+                None => all,
+            }
+        })
         .collect();
     if debug {
         for k in (0..lines.len()).filter(|&k| is_figure(k)) {
@@ -799,11 +870,11 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
     let mut chosen: Vec<Option<Candidate>> = vec![None; lines.len()];
     // Each list in turn, outer lists first (paths sort a table's cells after the body), so a
     // cell can start from the nearest line already placed above it.
-    let mut lists: Vec<&[usize]> = lines.iter().map(|(i, ..)| &anchors[*i][..anchors[*i].len() - 1]).collect();
-    lists.sort_by_key(|l| l.len());
+    let mut lists: Vec<Vec<usize>> = lines.iter().map(|(i, ..)| run_of(&anchors[*i])).collect();
+    lists.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
     lists.dedup();
     for list in lists {
-        let members: Vec<usize> = (0..lines.len()).filter(|&k| &anchors[lines[k].0][..anchors[lines[k].0].len() - 1] == list).collect();
+        let members: Vec<usize> = (0..lines.len()).filter(|&k| run_of(&anchors[lines[k].0]) == list).collect();
         let first = lines[members[0]].0;
         let start = (0..lines.len()).filter(|&k| lines[k].0 < first).filter_map(|k| chosen[k]).last().map(|c| c.dy).unwrap_or(0);
         let input: Vec<(f32, Vec<Candidate>, f32)> =
@@ -813,10 +884,10 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
         }
     }
     // The last offset found in each list: where a line found by shape alone starts looking.
-    let mut guesses: std::collections::HashMap<&[usize], f32> = std::collections::HashMap::new();
-    let list_of = |i: usize| &anchors[i][..anchors[i].len() - 1];
+    let mut guesses: std::collections::HashMap<Vec<usize>, f32> = std::collections::HashMap::new();
+    let list_of = |i: usize| run_of(&anchors[i]);
     for (k, &(i, m, strip)) in lines.iter().enumerate() {
-        let guess = guesses.get(list_of(i)).copied().unwrap_or(0.0);
+        let guess = guesses.get(&list_of(i)).copied().unwrap_or(0.0);
         // How far a line placed by shape may move: less than half the way to the lines drawn
         // next to it in its list, so in a run of look-alike lines it can't take a neighbour's
         // place.
@@ -847,6 +918,17 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             c = if chosen[k].is_some() { columns_of(&render, &scan_page, &o) } else { vec![] };
             let col_score = if c.is_empty() { 0.0 } else { c.iter().map(|c| c.score).sum::<f32>() / c.len() as f32 };
             sure = o.score >= SURE || (o.score >= 0.25 && col_score >= SURE_COLUMN + 0.1);
+            if let Some((dy, ..)) = pinned(k).filter(|p| p.2 >= PINNED) {
+                if (o.dy - dy).abs() > 4.0 {
+                    o.dy = dy;
+                }
+                // Where its words put it, though its picture doesn't match there: the type is
+                // likely the wrong size, and a centred line's width tells by how much.
+                if !sure && matches!(b, Block::P(p) if p.align == Align::Center) {
+                    c = span_ratio(&render, &scan_page, &o).map(|r| vec![r]).unwrap_or_default();
+                }
+                sure = true;
+            }
             if !sure {
                 // Placed by shape instead; its glyphs can't be matched, but a centred line's
                 // width still can: it scales the type so the line spans what it spans there.
@@ -897,12 +979,60 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             .filter(|o| o.score >= SURE)
     };
     let (head, foot) = (edge('H', &sheet.header), edge('F', &sheet.footer));
+    reject_strays(&sheet.blocks, &anchors, &mut found, &mut columns);
     let mut drawn = vec![None; n];
     for &(i, _, strip) in &lines {
         drawn[i] = Some(strip);
     }
     let agreement = agreement(&render, &scan_page);
-    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, head, foot })
+    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, spill, head, foot })
+}
+
+/// Letters and digits on a paragraph's first line (an equation counts about half its source).
+fn first_line_chars(b: &Block) -> usize {
+    let Block::P(p) = b else { return 0 };
+    let mut n = 0;
+    for r in &p.runs {
+        match r {
+            Run::Br { .. } => break,
+            Run::Text(t) => {
+                let line = t.text.split('\n').next().unwrap_or("");
+                n += line.chars().filter(|c| c.is_alphanumeric()).count();
+                if t.text.contains('\n') {
+                    break;
+                }
+            }
+            Run::Math { math, .. } => n += math.chars().filter(|c| c.is_alphanumeric()).count().div_ceil(2),
+            _ => {}
+        }
+    }
+    n
+}
+
+/// A table cell's line of a few characters (a number in an x/y table) matches a look-alike
+/// rows away about as well as its own place. Such a match is dropped when it is further from
+/// the median of its table's other matches than a table's rows ever drift apart.
+fn reject_strays(blocks: &[Block], anchors: &[super::Path], found: &mut [Option<Offset>], columns: &mut [Vec<Column>]) {
+    const SHORT: usize = 4;
+    const DRIFT: f32 = 8.0;
+    let tables: std::collections::BTreeSet<Vec<usize>> = anchors.iter().filter(|p| p.len() >= 4).map(|p| p[..p.len() - 3].to_vec()).collect();
+    for t in tables {
+        let inside: Vec<usize> = (0..anchors.len()).filter(|&i| anchors[i].len() > t.len() && anchors[i].starts_with(&t)).collect();
+        let long: Vec<f32> = inside.iter().filter(|&&i| super::block_at(blocks, &anchors[i]).is_some_and(|b| first_line_chars(b) > SHORT)).filter_map(|&i| found[i].map(|o| o.dy)).collect();
+        let mut dys: Vec<f32> = if long.len() >= 2 { long } else { inside.iter().filter_map(|&i| found[i].map(|o| o.dy)).collect() };
+        if dys.len() < 3 {
+            continue;
+        }
+        dys.sort_by(f32::total_cmp);
+        let median = dys[dys.len() / 2];
+        for &i in &inside {
+            let short = super::block_at(blocks, &anchors[i]).is_some_and(|b| first_line_chars(b) <= SHORT);
+            if short && found[i].is_some_and(|o| (o.dy - median).abs() > DRIFT) {
+                found[i] = None;
+                columns[i].clear();
+            }
+        }
+    }
 }
 
 /// The share of the rebuild's ink that lands on ink in the scan, give or take a pixel. Only the
@@ -1022,8 +1152,10 @@ fn fit_columns(b: &mut Block, cols: &[Column], base: f32) -> bool {
 /// A change the fit makes to the sheet's vertical layout.
 #[derive(Clone, Debug, PartialEq)]
 enum Edit {
-    /// Move the block at `path` (and everything after it in its list) down by `d` points.
-    Move { path: super::Path, d: f32 },
+    /// Move the block at `path` (and everything after it in its list) down by `d` points. Up,
+    /// it may take the space of the blocks of its list from `free` on (those after the last one
+    /// measured), and the space after the one before them.
+    Move { path: super::Path, d: f32, free: usize },
     /// Set a table row's minimum height, points.
     Row { table: super::Path, row: usize, height: f32 },
 }
@@ -1032,7 +1164,7 @@ enum Edit {
 /// offset and where it was drawn. `start` is the offset the list's first block already moves
 /// with: the page top (0) for the body, the row's offset for a cell.
 fn plan_list(blocks: &[Block], prefix: &[usize], start: f32, offs: &std::collections::HashMap<super::Path, (f32, f32)>, edits: &mut Vec<Edit>) {
-    let mut prev = start;
+    let (mut prev, mut free) = (start, 0);
     for (k, b) in blocks.iter().enumerate() {
         let path: super::Path = prefix.iter().copied().chain([k]).collect();
         let dy = match b {
@@ -1042,9 +1174,10 @@ fn plan_list(blocks: &[Block], prefix: &[usize], start: f32, offs: &std::collect
         if let Some(dy) = dy {
             // Any whole pixel (0.48 pt) counts: small steps left alone add up down the page.
             if (dy - prev).abs() >= 0.4 {
-                edits.push(Edit::Move { path, d: dy - prev });
+                edits.push(Edit::Move { path, d: dy - prev, free });
             }
             prev = dy;
+            free = k + 1;
         }
     }
 }
@@ -1093,47 +1226,70 @@ fn apply(sheet: &mut Sheet, e: &Edit) {
                 r.height = Some(*height);
             }
         }
-        Edit::Move { path, d } => {
+        Edit::Move { path, d, free } => {
             let k = *path.last().expect("path");
             if path.len() == 1 && k == 0 {
                 sheet.page.margins[0] = (sheet.page.margins[0] + d).max(0.0);
                 return;
             }
             let Some(list) = super::list_at(&mut sheet.blocks, path) else { return };
-            shift(list, k, *d);
+            shift(list, k, *d, *free);
         }
     }
 }
 
 /// Moves block `k` of a list down by `d` points (up when negative), keeping what is above it.
 /// Space is kept one-sided (`one_sided`): before a paragraph or figure, after anything else.
-fn shift(list: &mut Vec<Block>, k: usize, d: f32) {
-    let own = match &mut list[k] {
+/// Moving up takes the space just above first, then that of the unmeasured blocks above it
+/// back to `free` (see [`Edit::Move`]), and last closes up the lines of the block just above.
+fn shift(list: &mut Vec<Block>, k: usize, d: f32, free: usize) {
+    if d >= 0.0 {
+        match own_before(&mut list[k], k) {
+            Some(before) => *before += d,
+            None if k == 0 => list.insert(0, Block::Space { height: d }),
+            None => match &mut list[k - 1] {
+                Block::P(p) => p.after += d,
+                Block::Space { height } => *height += d,
+                _ => list.insert(k, Block::Space { height: d }),
+            },
+        }
+        return;
+    }
+    let mut need = -d;
+    let mut take = |v: &mut f32, least: f32| {
+        let t = need.min((*v - least).max(0.0));
+        *v -= t;
+        need -= t;
+    };
+    if let Some(before) = own_before(&mut list[k], k) {
+        take(before, 0.0);
+    }
+    // The blocks above, up to and including the space after the last one measured.
+    for i in (free.saturating_sub(1)..k).rev() {
+        match &mut list[i] {
+            Block::P(p) => {
+                take(&mut p.after, 0.0);
+                if i >= free {
+                    take(&mut p.before, 0.0);
+                }
+            }
+            Block::Space { height } => take(height, 1.0),
+            Block::Figure(f) if i >= free => take(&mut f.before, 0.0),
+            _ => {}
+        }
+    }
+    if need > 0.0 && k > 0 {
+        take_after(list, k - 1, -need);
+    }
+}
+
+/// A block's own space before, where it keeps it.
+fn own_before(b: &mut Block, k: usize) -> Option<&mut f32> {
+    match b {
         Block::P(p) => Some(&mut p.before),
         Block::Figure(f) => Some(&mut f.before),
         Block::Space { height } if k == 0 => Some(height),
         _ => None,
-    };
-    if let Some(before) = own {
-        let room = *before + d;
-        *before = room.max(0.0);
-        // Moving up past no space before: take it from the block above.
-        if room < 0.0 && k > 0 {
-            take_after(list, k - 1, room);
-        }
-        return;
-    }
-    if k == 0 {
-        if d > 0.0 {
-            list.insert(0, Block::Space { height: d });
-        }
-        return;
-    }
-    match &mut list[k - 1] {
-        Block::P(p) => p.after = (p.after + d).max(0.0),
-        Block::Space { height } => *height = (*height + d).max(1.0),
-        _ if d > 0.0 => list.insert(k, Block::Space { height: d }),
-        _ => {}
     }
 }
 /// Takes `d` (negative) points out from under block `i`: its space after first, then, for a
@@ -1162,6 +1318,64 @@ fn take_after(list: &mut [Block], i: usize, d: f32) {
         }
         Block::Space { height } => *height = (*height + d).max(1.0),
         _ => {}
+    }
+}
+
+/// Moves each block with an entry in `offs` (path: points to move down, where its first line
+/// was drawn) by its own offset less the one it already moves with; table rows grow or shrink
+/// to put the next row where it belongs. Planned first, then applied last-first so an inserted
+/// space can't shift a path still to do. Returns how many edits were made.
+fn place(sheet: &mut Sheet, offs: &std::collections::HashMap<super::Path, (f32, f32)>) -> usize {
+    let mut edits = vec![];
+    plan_list(&sheet.blocks, &[], 0.0, offs, &mut edits);
+    edits.sort_by(|a, b| {
+        let key = |e: &Edit| match e {
+            Edit::Move { path, .. } => path.clone(),
+            Edit::Row { table, row, .. } => table.iter().copied().chain([*row, usize::MAX]).collect(),
+        };
+        key(b).cmp(&key(a))
+    });
+    for e in &edits {
+        apply(sheet, e);
+    }
+    edits.len()
+}
+
+/// The vertical space [`squeeze`] scales in `blocks`, points.
+fn space(blocks: &[Block]) -> f32 {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::P(p) => p.before + p.after,
+            Block::Figure(f) => f.before,
+            Block::Space { height } => *height,
+            Block::Table(t) => t.rows.iter().map(|r| r.height.unwrap_or(0.0) * 0.5 + r.cells.iter().map(|c| space(&c.blocks)).fold(0.0, f32::max)).sum(),
+            Block::Break => 0.0,
+        })
+        .sum()
+}
+
+/// Finds `need` points down a one-page sheet that ran over: from the bottom margin first (down
+/// to 18 points), then from the space below the top-level block `tail` (what the fit couldn't
+/// place on the scan, so nothing vouches for its spacing), and only then from all the space on
+/// the page.
+fn make_room(sheet: &mut Sheet, mut need: f32, tail: usize) {
+    let m = &mut sheet.page.margins[2];
+    let take = need.min((*m - 18.0).max(0.0));
+    *m -= take;
+    need -= take;
+    let tail = tail.min(sheet.blocks.len());
+    for from in [tail, 0] {
+        if need <= 0.5 {
+            return;
+        }
+        let blocks = &mut sheet.blocks[from..];
+        let s = space(blocks);
+        if s > 1.0 {
+            let k = (1.0 - need / s).max(if from == 0 { 0.5 } else { 0.3 });
+            squeeze(blocks, k);
+            need -= s * (1.0 - k);
+        }
     }
 }
 
@@ -1254,21 +1468,27 @@ pub fn fit(scan: &Path, sheet: &mut Sheet, rounds: usize) -> Result<Report, Stri
     let (w, h) = ((sheet.page.width * K).round() as u32, (sheet.page.height * K).round() as u32);
     let mut shear = 0.0;
     let mut page = prepare_scan(scan, w, h, shear)?;
+    // A first placement from the scan's words, where each line is read: the model's spacing
+    // can be far enough off for the fit to settle on the wrong line.
+    // (`DOCUMENTASHION_NO_SEED` leaves the words out, to compare.)
+    let words = if std::env::var_os("DOCUMENTASHION_NO_SEED").is_some() { vec![] } else { seed::scan_words(&page) };
+    seed::seed(&page, sheet, &words)?;
     let mut last = Report::default();
     // The closest round so far: a measurement can flip between two readings, so the result is
     // the best state seen, not the last.
     let mut best: Option<(f32, Sheet, Report)> = None;
     for round in 0..rounds {
-        let Measure { anchors, found, columns, scales, head, foot, agreement, pages, .. } = measure(&page, sheet)?;
+        let Measure { anchors, found, columns, scales, head, foot, agreement, pages, spill, .. } = measure_with(&page, sheet, &words)?;
+        // For checking: each round's sheet, to a folder.
+        if let Some(dir) = std::env::var_os("DOCUMENTASHION_FIT_ROUNDS").filter(|d| !d.is_empty()) {
+            let _ = std::fs::write(Path::new(&dir).join(format!("round-{}.json", round + 1)), serde_json::to_string_pretty(&*sheet).unwrap_or_default());
+        }
         // A one-page worksheet that runs onto a second page has lost what went over: make room
-        // before anything else (the bottom margin first, then all the space down the page).
+        // for what went over, before anything else.
         if pages > 1 && !sheet.blocks.iter().any(|b| matches!(b, Block::Break)) {
-            if sheet.page.margins[2] > 20.0 {
-                sheet.page.margins[2] = (sheet.page.margins[2] * 0.5).max(18.0);
-            } else {
-                squeeze(&mut sheet.blocks, 0.85);
-            }
-            eprintln!("fit round {}: the sheet ran onto {pages} pages; made room", round + 1);
+            let tail = (0..anchors.len()).filter(|&i| found[i].is_some()).map(|i| anchors[i][0] + 1).max().unwrap_or(0);
+            make_room(sheet, spill + 2.0, tail);
+            eprintln!("fit round {}: the sheet ran {spill:.0} pt onto another page; made room", round + 1);
             continue;
         }
         let block = |i: usize| super::block_at(&sheet.blocks, &anchors[i]);
@@ -1382,25 +1602,10 @@ pub fn fit(scan: &Path, sheet: &mut Sheet, rounds: usize) -> Result<Report, Stri
             sheet.page.footer_at = (sheet.page.footer_at - f.dy).max(0.0);
             changed = true;
         }
-        // Vertical: each matched block moves by its own offset less the one it already moves
-        // with; table rows grow or shrink to put the next row where it belongs. Planned from
-        // this measurement, then applied last-first so an inserted space can't shift a path
-        // still to do.
+        // Vertical: each matched block to where the scan has it (see `place`).
         let offs: std::collections::HashMap<super::Path, (f32, f32)> =
             (0..anchors.len()).filter_map(|i| Some((anchors[i].clone(), (found[i]?.dy, found[i]?.y)))).collect();
-        let mut edits = vec![];
-        plan_list(&sheet.blocks, &[], 0.0, &offs, &mut edits);
-        edits.sort_by(|a, b| {
-            let key = |e: &Edit| match e {
-                Edit::Move { path, .. } => path.clone(),
-                Edit::Row { table, row, .. } => table.iter().copied().chain([*row, usize::MAX]).collect(),
-            };
-            key(b).cmp(&key(a))
-        });
-        changed |= !edits.is_empty();
-        for e in &edits {
-            apply(sheet, e);
-        }
+        changed |= place(sheet, &offs) > 0;
         if !changed {
             break;
         }
@@ -1499,9 +1704,19 @@ mod tests {
     fn a_block_moved_up_past_its_space_takes_from_the_one_above() {
         let p = |before: f32, after: f32| Block::P(Para { before, after, runs: vec![], ..Default::default() });
         let mut blocks = vec![p(0.0, 20.0), p(4.0, 0.0)];
-        shift(&mut blocks, 1, -10.0);
+        shift(&mut blocks, 1, -10.0, 1);
         let (Block::P(a), Block::P(b)) = (&blocks[0], &blocks[1]) else { panic!() };
         assert_eq!((a.after, b.before), (14.0, 0.0));
+    }
+
+    #[test]
+    fn a_block_moved_up_takes_the_space_of_unmeasured_blocks_above() {
+        let p = |before: f32| Block::P(Para { before, runs: vec![], ..Default::default() });
+        // Block 0 measured; block 1 (an answer blank) not; block 2 moves up 30 pt.
+        let mut blocks = vec![p(0.0), p(39.0), p(10.0)];
+        shift(&mut blocks, 2, -30.0, 1);
+        let before: Vec<f32> = blocks.iter().map(|b| if let Block::P(p) = b { p.before } else { -1.0 }).collect();
+        assert_eq!(before, vec![0.0, 19.0, 0.0]);
     }
 
     #[test]
@@ -1510,7 +1725,7 @@ mod tests {
         let p = |before: f32| Block::P(Para { before, runs: vec![text.clone()], ..Default::default() });
         let mut blocks = vec![p(0.0), p(1.0)];
         // Up 3 points: 1 from the space before, 2 from the line above (11.5 pt single spacing).
-        shift(&mut blocks, 1, -3.0);
+        shift(&mut blocks, 1, -3.0, 1);
         let (Block::P(a), Block::P(b)) = (&blocks[0], &blocks[1]) else { panic!() };
         assert_eq!((b.before, a.line), (0.0, Some(9.5)));
     }
@@ -1535,8 +1750,8 @@ mod tests {
         .collect();
         let mut edits = vec![];
         plan_list(&sheet.blocks, &[], 0.0, &offs, &mut edits);
-        assert!(edits.contains(&Edit::Move { path: vec![1], d: 2.0 }), "{edits:?}");
-        assert!(edits.contains(&Edit::Move { path: vec![1, 0, 0, 1], d: 3.0 }), "{edits:?}");
+        assert!(edits.contains(&Edit::Move { path: vec![1], d: 2.0, free: 1 }), "{edits:?}");
+        assert!(edits.contains(&Edit::Move { path: vec![1, 0, 0, 1], d: 3.0, free: 1 }), "{edits:?}");
         assert!(edits.contains(&Edit::Row { table: vec![1], row: 0, height: 110.0 }), "{edits:?}");
         assert_eq!(edits.len(), 3, "{edits:?}");
         for e in &edits {
