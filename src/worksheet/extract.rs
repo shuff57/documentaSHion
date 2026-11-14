@@ -30,7 +30,7 @@ Blocks:
    "rows":[{"height":null or minimum height,"cells":[{"blocks":[blocks],"span":1,"shade":null or "RRGGBB","valign":"top|center|bottom"}]}]}
    Use a borderless table to set things side by side (two columns of questions, a graph beside its questions), and a bordered one for printed tables (x/y tables, answer boxes).
 - Figure: {"type":"figure","vershion":"coordinate-grid","params":{...},"width":w,"height":h,"align":"left|center|right","alt":"what it shows"}
-   Draw printed graphs, axes, grids and number lines with these verSHion figures, setting the parameters so the drawing matches the print (range, step, numbering, arrows, gridlines). Width and height are the printed graph's own extent (its grid and axis numbers), not the space around it. Always set "style":"Print" and "show_answers":false, and set "equations" and "points" to "" unless lines or points are PRINTED on the graph (never what a student drew). Parameters you leave out keep their defaults:
+   Draw printed graphs, axes, grids and number lines with these verSHion figures, setting the parameters so the drawing matches the print (range, step, numbering, arrows, gridlines). Width and height are the printed graph's own extent (its grid and axis numbers), not the space around it. Always set "style":"Print" and "show_answers":false, and set "equations" and "points" to "" unless lines or points are PRINTED on the graph (never what a student drew). For a coordinate grid, "square": true makes one unit on x as long as one unit on y; when the axes count by different steps but the printed squares are square, set "square": false. Parameters you leave out keep their defaults:
 {FIGURES}
 - Vertical space: {"type":"space","height":h}
 - Page break: {"type":"break"}

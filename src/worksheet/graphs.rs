@@ -12,6 +12,7 @@ type At = super::Path;
 const PROMPT: &str = r#"This is one graph cropped from a scanned, printed school worksheet. Rebuild the PRINTED graph as a verSHion "{ID}" figure.
 Read it carefully:
 - Count the grid squares across and down, and read the numbers printed on the axes, to find where each axis starts and ends and what it counts by. An axis whose numbers stop short of the grid's edge still runs to the edge: count the squares.
+- "square": true makes one unit on x as long as one unit on y. When the axes count by different steps (say x by 1 and y by 5) but the printed squares are square, set "square": false.
 - Note whether the axes are numbered (and on every line or every 2nd, 5th, 10th), whether they have arrowheads, the axis letters, a title, and how heavy the grid lines are.
 - Include lines, curves and points only if they were PRINTED. Leave out everything drawn or written by hand (students' lines, points, labels, answers): a blank printed grid has no equations and no points.
 Its current settings (some may be wrong): {CURRENT}

@@ -196,11 +196,13 @@ pub fn figure_png(f: &Figure) -> Result<Vec<u8>, String> {
     let px_h = (f.height / 72.0 * 300.0).round().max(1.0) as u32;
     let png = tmp("figure.png");
     // The figure's own blank margin is trimmed off: the size read from the scan is the size of
-    // what is printed, not of a box around it.
+    // what is printed, not of a box around it. It keeps its proportions (a stretched graph
+    // stretches its numbers too), centred in the box.
     let out = Command::new("magick")
         .args(["-density", "300", "-background", "white"])
         .arg(&src)
-        .args(["-flatten", "-fuzz", "2%", "-trim", "+repage", "-resize", &format!("{px_w}x{px_h}!")])
+        .args(["-flatten", "-fuzz", "2%", "-trim", "+repage", "-resize", &format!("{px_w}x{px_h}")])
+        .args(["-gravity", "center", "-extent", &format!("{px_w}x{px_h}")])
         .arg(&png)
         .output()
         .map_err(|e| format!("magick: {e}"))?;

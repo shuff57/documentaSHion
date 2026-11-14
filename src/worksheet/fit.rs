@@ -745,8 +745,18 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             chosen[*k] = c;
         }
     }
-    let mut guess = 0.0;
+    // The last offset found in each list: where a line found by shape alone starts looking.
+    let mut guesses: std::collections::HashMap<&[usize], f32> = std::collections::HashMap::new();
+    let list_of = |i: usize| &anchors[i][..anchors[i].len() - 1];
     for (k, &(i, m, strip)) in lines.iter().enumerate() {
+        let guess = guesses.get(list_of(i)).copied().unwrap_or(0.0);
+        // How far a line placed by shape may move: less than half the way to the lines drawn
+        // next to it in its list, so in a run of look-alike lines it can't take a neighbour's
+        // place.
+        let room = {
+            let same: Vec<f32> = lines.iter().filter(|(j, ..)| list_of(*j) == list_of(i) && *j != i).map(|(_, mm, _)| (mm.y - m.y).abs()).collect();
+            (same.into_iter().fold(f32::MAX, f32::min) * 0.45).min(30.0)
+        };
         let b = super::block_at(&sheet.blocks, &anchors[i]).expect("anchor");
         let figure = matches!(b, Block::Figure(_));
         let (r, sc) = if figure { (&soft_render, &soft_scan) } else { (&render, &scan_page) };
@@ -772,7 +782,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             if !sure {
                 // Placed by shape instead; its glyphs can't be matched, but a centred line's
                 // width still can: it scales the type so the line spans what it spans there.
-                if let Some((dy, score)) = band(&render, &scan_page, &o, guess, 30.0).filter(|b| b.1 >= 0.8) {
+                if let Some((dy, score)) = band(&render, &scan_page, &o, guess, room).filter(|b| b.1 >= 0.8 && room >= 4.0) {
                     o = Offset { dy, dx: 0.0, score, ..o };
                     let centred = matches!(b, Block::P(p) if p.align == Align::Center);
                     c = if centred { span_ratio(&render, &scan_page, &o).map(|r| vec![r]).unwrap_or_default() } else { vec![] };
@@ -795,9 +805,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             );
         }
         if sure {
-            if anchors[i].len() == 1 {
-                guess = o.dy;
-            }
+            guesses.insert(list_of(i), o.dy);
             found[i] = Some(o);
             columns[i] = c;
         } else {
@@ -1149,6 +1157,40 @@ pub fn fit(scan: &Path, sheet: &mut Sheet, rounds: usize) -> Result<Report, Stri
             changed = true;
         } else {
             let base = sheet.size;
+            // A list's lines that couldn't be matched take its matched lines' median size
+            // correction: type set too big or small throughout keeps lines from matching at all.
+            let mut by_list: std::collections::HashMap<Vec<usize>, Vec<f32>> = std::collections::HashMap::new();
+            for (i, path) in anchors.iter().enumerate() {
+                for c in columns[i].iter().filter(|c| c.score >= SURE_COLUMN) {
+                    by_list.entry(path[..path.len() - 1].to_vec()).or_default().push(c.scale);
+                }
+            }
+            for (i, path) in anchors.iter().enumerate() {
+                if found[i].is_some() {
+                    continue;
+                }
+                let Some(mut v) = by_list.get(&path[..path.len() - 1]).cloned().filter(|v| v.len() >= 3) else { continue };
+                v.sort_by(f32::total_cmp);
+                let m = v[v.len() / 2];
+                if (m - 1.0).abs() < 0.04 {
+                    continue;
+                }
+                if let Some(Block::P(p)) = super::block_at_mut(&mut sheet.blocks, path) {
+                    let s = 1.0 + (m.clamp(0.8, 1.25) - 1.0) * 0.7;
+                    for r in &mut p.runs {
+                        let size = match r {
+                            Run::Text(t) => &mut t.size,
+                            Run::Math { size, .. } => size,
+                            _ => continue,
+                        };
+                        let new = ((size.unwrap_or(base) * s) * 2.0).round() / 2.0;
+                        if Some(new) != *size {
+                            *size = Some(new);
+                            changed = true;
+                        }
+                    }
+                }
+            }
             for (i, path) in anchors.iter().enumerate() {
                 let Some(b) = super::block_at_mut(&mut sheet.blocks, path) else { continue };
                 match b {
