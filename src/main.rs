@@ -12,9 +12,18 @@ mod secrets;
 mod services;
 mod ui;
 mod update;
+mod worksheet;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "ws") {
+        if let Err(e) = worksheet::cli::main(&args[1..]) {
+            eprintln!("documentashion ws: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if let Some(path) = std::env::args()
         .nth(1)
         .filter(|s| s == "--preview")

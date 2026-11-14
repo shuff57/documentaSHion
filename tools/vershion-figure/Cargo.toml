@@ -1,0 +1,15 @@
+[package]
+name = "vershion-figure"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Draws one verSHion figure as SVG, for documentaSHion's worksheet rebuild."
+publish = false
+
+# Its own workspace: documentaSHion does not link verSHion, it runs this program.
+[workspace]
+
+[dependencies]
+# Pinned to a commit of verSHion's `main`; bump `rev` on purpose.
+vershion = { git = "https://github.com/shuff57/verSHion", rev = "45154854" }
+serde_json = "1"
