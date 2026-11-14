@@ -30,7 +30,7 @@ Blocks:
    "rows":[{"height":null or minimum height,"cells":[{"blocks":[blocks],"span":1,"shade":null or "RRGGBB","valign":"top|center|bottom"}]}]}
    Use a borderless table to set things side by side (two columns of questions, a graph beside its questions), and a bordered one for printed tables (x/y tables, answer boxes).
 - Figure: {"type":"figure","vershion":"coordinate-grid","params":{...},"width":w,"height":h,"align":"left|center|right","alt":"what it shows"}
-   Draw printed graphs, axes, grids and number lines with these verSHion figures, setting the parameters so the drawing matches the print (range, step, numbering, arrows, gridlines). Parameters you leave out keep their defaults:
+   Draw printed graphs, axes, grids and number lines with these verSHion figures, setting the parameters so the drawing matches the print (range, step, numbering, arrows, gridlines). Width and height are the printed graph's own extent (its grid and axis numbers), not the space around it. Always set "style":"Print" and "show_answers":false, and set "equations" and "points" to "" unless lines or points are PRINTED on the graph (never what a student drew). Parameters you leave out keep their defaults:
 {FIGURES}
 - Vertical space: {"type":"space","height":h}
 - Page break: {"type":"break"}
@@ -57,7 +57,12 @@ pub fn prompt(w: u32, h: u32) -> String {
 
 /// The parameters of [`FIGURES`], from the verSHion figure program.
 fn describe_figures() -> String {
-    let out = std::process::Command::new(super::cli::vershion_figure()).arg("--describe").args(FIGURES).output();
+    describe(&FIGURES)
+}
+
+/// The parameters of verSHion figures `ids`, one per line, from the verSHion figure program.
+pub fn describe(ids: &[&str]) -> String {
+    let out = std::process::Command::new(super::cli::vershion_figure()).arg("--describe").args(ids).output();
     let Some(out) = out.ok().filter(|o| o.status.success()) else {
         return "  (verSHion figures are not available; use a borderless table or leave the figure out)".into();
     };

@@ -56,7 +56,8 @@ pub fn write(sheet: &Sheet, out: &Path, figure: Draw) -> Result<(), String> {
     write_as(sheet, out, figure, false)
 }
 
-/// The text of the marker [`write_as`] puts at the start of a top-level block when probing:
+/// The text of the marker [`write_as`] puts at the start of each paragraph, spacer and figure
+/// when probing, numbered in [`super::anchors`] order:
 /// `part` is `B` (body), `H` (header) or `F` (footer).
 ///
 /// The marker is drawn with no advance, so its letters overlap and a PDF reader may give them
@@ -68,10 +69,14 @@ pub fn marker(part: char, i: usize) -> String {
     format!("Q{part}{hundreds}{}{}Z", digit(b'a', i / 10), digit(b'k', i))
 }
 
-/// Like [`write`]; `probe` starts every top-level block with a white one-point [`marker`] of
+/// Like [`write`]; `probe` starts every paragraph, spacer and figure, in tables too, with a
+/// white one-point [`marker`] of
 /// no width, so the block's first line can be found in a PDF of the document.
 pub fn write_as(sheet: &Sheet, out: &Path, figure: Draw, probe: bool) -> Result<(), String> {
-    let mark = |part: char, i: usize| probe.then(|| marker(part, i));
+    // The next marker of each part, when probing.
+    let mut head_mark = probe.then_some(('H', 0));
+    let mut foot_mark = probe.then_some(('F', 0));
+    let mut body_mark = probe.then_some(('B', 0));
     let mut media = Media { files: vec![], rels: vec![] };
     let mut ids = 1u32;
     let pg = &sheet.page;
@@ -86,21 +91,21 @@ pub fn write_as(sheet: &Sheet, out: &Path, figure: Draw, probe: bool) -> Result<
         behind(&mut header, w, h, &rid, &mut ids);
         header.push_str("</w:p>");
     }
-    for (i, b) in sheet.header.iter().enumerate() {
-        block(&mut header, b, sheet, width, &mut media, &mut ids, figure, mark('H', i).as_deref())?;
+    for b in &sheet.header {
+        block(&mut header, b, sheet, width, &mut media, &mut ids, figure, &mut head_mark)?;
     }
     let has_header = !header.is_empty();
     let header_rels = media.take_rels("");
     let mut footer = String::new();
-    for (i, b) in sheet.footer.iter().enumerate() {
-        block(&mut footer, b, sheet, width, &mut media, &mut ids, figure, mark('F', i).as_deref())?;
+    for b in &sheet.footer {
+        block(&mut footer, b, sheet, width, &mut media, &mut ids, figure, &mut foot_mark)?;
     }
     let has_footer = !footer.is_empty();
     let footer_rels = media.take_rels("");
 
     let mut body = String::new();
-    for (i, b) in sheet.blocks.iter().enumerate() {
-        block(&mut body, b, sheet, width, &mut media, &mut ids, figure, mark('B', i).as_deref())?;
+    for b in &sheet.blocks {
+        block(&mut body, b, sheet, width, &mut media, &mut ids, figure, &mut body_mark)?;
     }
     // A body must end with a paragraph, and one after a final table keeps it editable.
     body.push_str(r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/></w:pPr></w:p>"#);
@@ -232,24 +237,37 @@ fn block(
     media: &mut Media,
     ids: &mut u32,
     figure: Draw,
-    mark: Option<&str>,
+    mark: &mut Option<(char, usize)>,
 ) -> Result<(), String> {
+    // This block's marker, if probing: tables and breaks take none (a table's paragraphs do).
+    fn take(mark: &mut Option<(char, usize)>) -> Option<String> {
+        mark.as_mut().map(|(part, n)| {
+            *n += 1;
+            marker(*part, *n - 1)
+        })
+    }
     match b {
-        Block::P(p) => para(out, p, sheet, mark),
+        Block::P(p) => para(out, p, sheet, take(mark).as_deref()),
         Block::Space { height } => {
             let _ = write!(
                 out,
                 r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="{}" w:lineRule="exact"/></w:pPr>{}</w:p>"#,
                 tw(height.max(1.0)),
-                mark.map(marker_run).unwrap_or_default()
+                take(mark).as_deref().map(marker_run).unwrap_or_default()
             );
         }
         Block::Break => out.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#),
         Block::Figure(f) => {
             let png = figure(f)?;
             let rid = media.add(png);
-            let _ = write!(out, r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0"/>{}</w:pPr>"#, jc(f.align));
-            out.push_str(&mark.map(marker_run).unwrap_or_default());
+            let _ = write!(
+                out,
+                r#"<w:p><w:pPr><w:spacing w:before="{}" w:after="0"/>{}{}</w:pPr>"#,
+                tw(f.before),
+                if f.indent != 0.0 { format!(r#"<w:ind w:left="{}"/>"#, tw(f.indent)) } else { String::new() },
+                jc(f.align)
+            );
+            out.push_str(&take(mark).as_deref().map(marker_run).unwrap_or_default());
             drawing(out, f, &rid, ids);
             out.push_str("</w:p>");
         }
@@ -441,7 +459,7 @@ fn table(
     media: &mut Media,
     ids: &mut u32,
     figure: Draw,
-    mark: Option<&str>,
+    mark: &mut Option<(char, usize)>,
 ) -> Result<(), String> {
     let total: f32 = t.widths.iter().sum();
     let line = r#"w:val="single" w:sz="6" w:space="0" w:color="000000""#;
@@ -489,10 +507,8 @@ fn table(
             }
             out.push_str("</w:tcPr>");
             let mut inner = String::new();
-            for (k, b) in c.blocks.iter().enumerate() {
-                // The marker goes in the table's first paragraph.
-                let first = std::ptr::eq(row, &t.rows[0]) && col == span && k == 0;
-                block(&mut inner, b, sheet, w, media, ids, figure, mark.filter(|_| first))?;
+            for b in &c.blocks {
+                block(&mut inner, b, sheet, w, media, ids, figure, mark)?;
             }
             // A cell must end with a paragraph.
             if !inner.ends_with("</w:p>") {

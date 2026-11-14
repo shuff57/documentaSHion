@@ -6,6 +6,7 @@
 //! documentashion ws render  <doc.docx> <out.png>                      draw it with WordCraft
 //! documentashion ws compare <scan.png> <doc.docx> <out.png> [--shear S] scan and rebuild overlaid
 //! documentashion ws fit     <scan.png> <sheet.json> [--rounds N]      line the rebuild up with the scan
+//! documentashion ws graphs  <scan.png> <sheet.json> [--shear S]       read each graph again, close up
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
 //! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
 //! ```
@@ -15,7 +16,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|upright|rebuild …";
+const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|graphs|upright|rebuild …";
 
 pub fn main(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -57,6 +58,14 @@ pub fn main(args: &[String]) -> Result<(), String> {
             save(&sheet, path)
         }
         "upright" => upright(Path::new(arg(1)?), Path::new(arg(2)?)).map(|_| ()),
+        "graphs" => {
+            let path = Path::new(arg(2)?);
+            let mut sheet = load(path)?;
+            let shear = flag("--shear").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let n = graphs::reread(Path::new(arg(1)?), &mut sheet, shear, &model)?;
+            eprintln!("read {n} graphs again");
+            save(&sheet, path)
+        }
         "rebuild" => {
             let out = Path::new(arg(2)?);
             rebuild(Path::new(arg(1)?), out, &model).map(|r| eprintln!("{}: {r}", out.display()))
@@ -85,8 +94,15 @@ pub fn rebuild(scan: &Path, out: &Path, model: &str) -> Result<fit::Report, Stri
     let mut sheet = extract::extract(&page, model)?;
     let json = out.with_extension("json");
     save(&sheet, &json)?;
-    let report = fit::fit(&page, &mut sheet, 10)?;
+    let mut report = fit::fit(&page, &mut sheet, 10)?;
     save(&sheet, &json)?;
+    // Graphs are read again close up once the fit has found them on the scan, then fitted again
+    // as redrawn.
+    if graphs::reread(&page, &mut sheet, report.shear, model)? > 0 {
+        save(&sheet, &json)?;
+        report = fit::fit(&page, &mut sheet, 10)?;
+        save(&sheet, &json)?;
+    }
     build(&sheet, out)?;
     Ok(report)
 }
@@ -179,10 +195,12 @@ pub fn figure_png(f: &Figure) -> Result<Vec<u8>, String> {
     let px_w = (f.width / 72.0 * 300.0).round().max(1.0) as u32;
     let px_h = (f.height / 72.0 * 300.0).round().max(1.0) as u32;
     let png = tmp("figure.png");
+    // The figure's own blank margin is trimmed off: the size read from the scan is the size of
+    // what is printed, not of a box around it.
     let out = Command::new("magick")
         .args(["-density", "300", "-background", "white"])
         .arg(&src)
-        .args(["-flatten", "-resize", &format!("{px_w}x{px_h}!")])
+        .args(["-flatten", "-fuzz", "2%", "-trim", "+repage", "-resize", &format!("{px_w}x{px_h}!")])
         .arg(&png)
         .output()
         .map_err(|e| format!("magick: {e}"))?;

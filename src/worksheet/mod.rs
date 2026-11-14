@@ -10,6 +10,7 @@ pub mod cli;
 pub mod docx;
 pub mod extract;
 pub mod fit;
+pub mod graphs;
 pub mod orient;
 
 use serde::{Deserialize, Serialize};
@@ -346,9 +347,88 @@ pub struct Figure {
     pub height: f32,
     #[serde(default)]
     pub align: Align,
+    /// Space above it and its left indent, points.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub before: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub indent: f32,
     /// What it shows, for screen readers.
     #[serde(default)]
     pub alt: String,
+}
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+/// Where a block is in a sheet: its index in the body, then, for each table it sits in, the
+/// row, the cell and its index in that cell.
+pub type Path = Vec<usize>;
+
+/// The paragraphs, spacers and figures of `blocks`, tables included, in document order: the
+/// order [`docx::write_as`] numbers its probe markers in.
+pub fn anchors(blocks: &[Block]) -> Vec<Path> {
+    fn walk(blocks: &[Block], prefix: &mut Path, out: &mut Vec<Path>) {
+        for (i, b) in blocks.iter().enumerate() {
+            prefix.push(i);
+            match b {
+                Block::P(_) | Block::Space { .. } | Block::Figure(_) => out.push(prefix.clone()),
+                Block::Table(t) => {
+                    for (r, row) in t.rows.iter().enumerate() {
+                        for (c, cell) in row.cells.iter().enumerate() {
+                            prefix.extend([r, c]);
+                            walk(&cell.blocks, prefix, out);
+                            prefix.truncate(prefix.len() - 2);
+                        }
+                    }
+                }
+                Block::Break => {}
+            }
+            prefix.pop();
+        }
+    }
+    let mut out = vec![];
+    walk(blocks, &mut vec![], &mut out);
+    out
+}
+
+/// The block at `path`.
+pub fn block_at<'a>(blocks: &'a [Block], path: &[usize]) -> Option<&'a Block> {
+    let b = blocks.get(*path.first()?)?;
+    match (b, &path[1..]) {
+        (_, []) => Some(b),
+        (Block::Table(t), [r, c, rest @ ..]) => block_at(&t.rows.get(*r)?.cells.get(*c)?.blocks, rest),
+        _ => None,
+    }
+}
+
+/// The block at `path`, to change.
+pub fn block_at_mut<'a>(blocks: &'a mut [Block], path: &[usize]) -> Option<&'a mut Block> {
+    let b = blocks.get_mut(*path.first()?)?;
+    match (b, &path[1..]) {
+        (b, []) => Some(b),
+        (Block::Table(t), [r, c, rest @ ..]) => block_at_mut(&mut t.rows.get_mut(*r)?.cells.get_mut(*c)?.blocks, rest),
+        _ => None,
+    }
+}
+
+/// The list of blocks a path's last index is in: the body, or a table cell's blocks.
+pub fn list_at<'a>(blocks: &'a mut Vec<Block>, path: &[usize]) -> Option<&'a mut Vec<Block>> {
+    match path {
+        [] | [_] => Some(blocks),
+        [i, r, c, rest @ ..] => match blocks.get_mut(*i)? {
+            Block::Table(t) => list_at(&mut t.rows.get_mut(*r)?.cells.get_mut(*c)?.blocks, rest),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The table at `path`, to change.
+pub fn table_at_mut<'a>(blocks: &'a mut [Block], path: &[usize]) -> Option<&'a mut Table> {
+    match block_at_mut(blocks, path)? {
+        Block::Table(t) => Some(t),
+        _ => None,
+    }
 }
 
 impl Sheet {
@@ -424,6 +504,22 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchors_walk_into_tables_in_document_order() {
+        let s: Sheet = serde_json::from_str(
+            r#"{"blocks":[{"type":"p","runs":[]},{"type":"table","widths":[10,10],"rows":[{"cells":[
+                {"blocks":[{"type":"p","runs":[]},{"type":"figure","path":"x.png","width":1,"height":1}]},
+                {"blocks":[{"type":"p","runs":[]}]}]}]},{"type":"break"},{"type":"space","height":3}]}"#,
+        )
+        .unwrap();
+        let a = anchors(&s.blocks);
+        assert_eq!(a, vec![vec![0], vec![1, 0, 0, 0], vec![1, 0, 0, 1], vec![1, 0, 1, 0], vec![3]]);
+        assert!(matches!(block_at(&s.blocks, &a[2]), Some(Block::Figure(_))));
+        let mut blocks = s.blocks.clone();
+        assert_eq!(list_at(&mut blocks, &a[2]).unwrap().len(), 2);
+        assert_eq!(list_at(&mut blocks, &a[4]).unwrap().len(), 4);
+    }
 
     #[test]
     fn tabs_typed_in_text_become_tab_runs() {
