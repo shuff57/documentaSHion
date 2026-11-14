@@ -85,7 +85,8 @@ pub fn write_as(sheet: &Sheet, out: &Path, figure: Draw, probe: bool) -> Result<
 
     // Header: the graph paper, anchored to the page behind the text, then the header blocks.
     let mut header = String::new();
-    if let Some(g) = &pg.background {
+    // Not when probing: the fit compares what is printed on the sheet, not the paper.
+    if let Some(g) = pg.background.as_ref().filter(|_| !probe) {
         let rid = media.add(grid_png(g, w, h)?);
         let _ = write!(header, r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/></w:pPr>"#);
         behind(&mut header, w, h, &rid, &mut ids);

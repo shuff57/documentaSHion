@@ -608,6 +608,8 @@ pub struct Measure {
     /// `None` for one with nothing to match (a spacer, an empty paragraph).
     pub drawn: Vec<Option<[u32; 4]>>,
     /// The first header and footer anchor's offsets.
+    /// How much of the rebuild's printed ink lands on ink in the scan (see [`agreement`]).
+    pub agreement: f32,
     pub head: Option<Offset>,
     pub foot: Option<Offset>,
 }
@@ -892,7 +894,29 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
     for &(i, _, strip) in &lines {
         drawn[i] = Some(strip);
     }
-    Ok(Measure { anchors, found, columns, scales, drawn, head, foot })
+    let agreement = agreement(&render, &scan_page);
+    Ok(Measure { anchors, found, columns, scales, drawn, agreement, head, foot })
+}
+
+/// The share of the rebuild's ink that lands on ink in the scan, give or take a pixel. Only the
+/// rebuild's ink is counted, so handwriting on the scan costs nothing, and a misplaced line
+/// lands on paper: it judges a whole state of the sheet the same way every round.
+pub fn agreement(render: &GrayImage, scan: &GrayImage) -> f32 {
+    let (w, h) = render.dimensions();
+    let inked = |g: &GrayImage, x: u32, y: u32| x < g.width() && y < g.height() && g.get_pixel(x, y).0[0] < 150;
+    let (mut ink, mut hit) = (0u32, 0u32);
+    for y in (1..h.saturating_sub(1)).step_by(2) {
+        for x in (1..w.saturating_sub(1)).step_by(2) {
+            if !inked(render, x, y) {
+                continue;
+            }
+            ink += 1;
+            if (y - 1..=y + 1).any(|yy| (x - 1..=x + 1).any(|xx| inked(scan, xx, yy))) {
+                hit += 1;
+            }
+        }
+    }
+    if ink == 0 { 0.0 } else { hit as f32 / ink as f32 }
 }
 
 /// Below this correlation a figure's match is not trusted.
@@ -1162,13 +1186,21 @@ pub struct Report {
     pub blocks: usize,
     /// The shear the scan needed (see [`prepare_scan`]).
     pub shear: f32,
+    /// See [`agreement`].
+    pub agreement: f32,
 }
 impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{}/{} lines and figures matched, off by {:.1} pt on average and {:.1} pt at worst down, {:.1} pt at worst across (scan shear {:+.4})",
-            self.matched, self.blocks, self.mean, self.worst, self.across, self.shear
+            "{}/{} lines and figures matched, off by {:.1} pt on average and {:.1} pt at worst down, {:.1} pt at worst across; {:.0}% of the print on the scan's (scan shear {:+.4})",
+            self.matched,
+            self.blocks,
+            self.mean,
+            self.worst,
+            self.across,
+            self.agreement * 100.0,
+            self.shear
         )
     }
 }
@@ -1181,6 +1213,7 @@ fn report(body: &[Option<Offset>], lines: usize, starts: &[(f32, f32)]) -> Repor
         blocks: lines,
         across: starts.iter().map(|s| s.1.abs()).fold(0.0, f32::max),
         shear: 0.0,
+        agreement: 0.0,
     }
 }
 
@@ -1195,7 +1228,7 @@ pub fn fit(scan: &Path, sheet: &mut Sheet, rounds: usize) -> Result<Report, Stri
     // the best state seen, not the last.
     let mut best: Option<(f32, Sheet, Report)> = None;
     for round in 0..rounds {
-        let Measure { anchors, found, columns, scales, head, foot, .. } = measure(&page, sheet)?;
+        let Measure { anchors, found, columns, scales, head, foot, agreement, .. } = measure(&page, sheet)?;
         let block = |i: usize| super::block_at(&sheet.blocks, &anchors[i]);
         // Where left-aligned body lines start on the scan against the rebuild: the steadiest
         // horizontal reading, since a line's width depends on the font as well.
@@ -1204,9 +1237,11 @@ pub fn fit(scan: &Path, sheet: &mut Sheet, rounds: usize) -> Result<Report, Stri
             .filter_map(|i| Some((found[i]?.y, columns[i].first().filter(|c| c.score >= SURE_COLUMN)?.dx)))
             .collect();
         let lines = (0..anchors.len()).filter(|&i| matches!(block(i), Some(Block::P(_) | Block::Figure(_)))).count();
-        last = Report { shear, ..report(&found, lines, &starts) };
+        last = Report { shear, agreement, ..report(&found, lines, &starts) };
         eprintln!("fit round {}: {last}", round + 1);
-        let score = last.mean + last.worst * 0.5 + last.across * 0.5 - last.matched as f32 * 2.0;
+        // Judged on the whole page the same way every round; how many lines matched or how far
+        // they were off depends on which lines each round could match.
+        let score = -agreement;
         if best.as_ref().is_none_or(|b| score < b.0) {
             best = Some((score, sheet.clone(), last));
         }
@@ -1385,6 +1420,22 @@ mod tests {
         let at = ncc_wide(&t, &s, 0, 4, 1.0, 0);
         assert!(at > 0.9, "{at}");
         assert!(ncc_wide(&t, &s, 0, 0, 1.0, 0) < 0.3);
+    }
+
+    #[test]
+    fn agreement_ignores_extra_ink_on_the_scan() {
+        let mut r = GrayImage::from_pixel(40, 20, Luma([255]));
+        for x in 5..30 {
+            r.put_pixel(x, 9, Luma([0]));
+            r.put_pixel(x, 10, Luma([0]));
+        }
+        let mut s = r.clone();
+        for x in 0..40 {
+            s.put_pixel(x, 2, Luma([0]));
+        }
+        assert!(agreement(&r, &s) > 0.99);
+        let blank = GrayImage::from_pixel(40, 20, Luma([255]));
+        assert!(agreement(&r, &blank) < 0.01);
     }
 
     #[test]
