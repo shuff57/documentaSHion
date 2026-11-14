@@ -204,42 +204,6 @@ fn ink(v: u8) -> f32 {
     (1.0 - v as f32 / 255.0).max(0.0)
 }
 
-/// Normalised cross-correlation of the strip `t` (from the rendering, at `tx`,`ty`) against the
-/// scan at offset `dx`,`dy`, sampling every `step` pixels.
-fn ncc(t: &GrayImage, tx: u32, ty: u32, tw: u32, th: u32, s: &GrayImage, dx: i32, dy: i32, step: u32) -> f32 {
-    let (mut sa, mut sb, mut saa, mut sbb, mut sab, mut n) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
-    let mut tried = 0.0;
-    let mut y = 0;
-    while y < th {
-        let mut x = 0;
-        while x < tw {
-            tried += 1.0;
-            let (ax, ay) = (tx + x, ty + y);
-            let (bx, by) = (ax as i32 + dx, ay as i32 + dy);
-            if bx >= 0 && by >= 0 && (bx as u32) < s.width() && (by as u32) < s.height() && ax < t.width() && ay < t.height() {
-                let a = ink(t.get_pixel(ax, ay).0[0]);
-                let b = ink(s.get_pixel(bx as u32, by as u32).0[0]);
-                sa += a;
-                sb += b;
-                saa += a * a;
-                sbb += b * b;
-                sab += a * b;
-                n += 1.0;
-            }
-            x += step;
-        }
-        y += step;
-    }
-    // A strip mostly off the page matches a few stray pixels by chance: it doesn't count.
-    if n < 1.0 || n < tried * 0.9 {
-        return 0.0;
-    }
-    let cov = sab - sa * sb / n;
-    let va = saa - sa * sa / n;
-    let vb = sbb - sb * sb / n;
-    if va <= 1e-6 || vb <= 1e-6 { 0.0 } else { cov / (va * vb).sqrt() }
-}
-
 /// A block's measured offset from where it should be: points to move it down and right, and how
 /// sure the match is (correlation, 0 to 1).
 #[derive(Clone, Copy, Debug)]
@@ -285,20 +249,95 @@ struct Candidate {
     scale: f32,
 }
 
+/// The widths a line is tried at against the scan, as drawn: the type is often a size off
+/// until the fit has corrected it.
+const WIDTHS: [f32; 7] = [0.82, 0.88, 0.94, 1.0, 1.06, 1.12, 1.18];
+
 /// How far down the page a line is looked for, either way, points.
 const SEARCH: f32 = 150.0;
 
+/// The pixels of a strip a line is compared on: its letters and a band of `PAD` pixels around
+/// them, every `step` pixels, with the rendering's ink there. Handwriting in the answer space
+/// beside or under a line falls outside, so it doesn't count against the match; a line out of
+/// place still lands its letters on paper and scores badly.
+fn template(render: &GrayImage, [tx, ty, tw, th]: [u32; 4], step: u32) -> Vec<(u32, u32, f32)> {
+    const PAD: i32 = 3;
+    let (x1, y1) = ((tx + tw).min(render.width()), (ty + th).min(render.height()));
+    let inked = |x: u32, y: u32| render.get_pixel(x, y).0[0] < 190;
+    // Columns and rows near ink, from a dilated mask.
+    let (w, h) = ((x1 - tx) as i32, (y1 - ty) as i32);
+    let mut near = vec![false; (w * h).max(0) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            if inked(tx + x as u32, ty + y as u32) {
+                for yy in (y - PAD).max(0)..=(y + PAD).min(h - 1) {
+                    for xx in (x - PAD).max(0)..=(x + PAD).min(w - 1) {
+                        near[(yy * w + xx) as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut out = vec![];
+    for y in (0..h).step_by(step as usize) {
+        for x in (0..w).step_by(step as usize) {
+            if near[(y * w + x) as usize] {
+                let (ax, ay) = (tx + x as u32, ty + y as u32);
+                out.push((ax, ay, ink(render.get_pixel(ax, ay).0[0])));
+            }
+        }
+    }
+    out
+}
+
+/// Normalised cross-correlation of a [`template`] against the scan moved `dx`, `dy`, with the
+/// template `wide` times as wide on the scan from column `ox` (the line's start): type set a
+/// little bigger or smaller still lines up letter for letter.
+fn ncc_wide(t: &[(u32, u32, f32)], s: &GrayImage, dx: i32, dy: i32, wide: f32, ox: u32) -> f32 {
+    let (mut sa, mut sb, mut saa, mut sbb, mut sab, mut n) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
+    for &(x, y, a) in t {
+        let x = if wide == 1.0 { x as i32 } else { ox as i32 + ((x as f32 - ox as f32) * wide).round() as i32 };
+        let (bx, by) = (x + dx, y as i32 + dy);
+        if bx < 0 || by < 0 || bx as u32 >= s.width() || by as u32 >= s.height() {
+            continue;
+        }
+        let b = ink(s.get_pixel(bx as u32, by as u32).0[0]);
+        sa += a;
+        sb += b;
+        saa += a * a;
+        sbb += b * b;
+        sab += a * b;
+        n += 1.0;
+    }
+    // Mostly off the page: a few stray pixels match by chance.
+    if n < 1.0 || n < t.len() as f32 * 0.9 {
+        return 0.0;
+    }
+    let cov = sab - sa * sb / n;
+    let (va, vb) = (saa - sa * sa / n, sbb - sb * sb / n);
+    if va <= 1e-6 || vb <= 1e-6 { 0.0 } else { cov / (va * vb).sqrt() }
+}
+
 /// The best few places for a strip on the scan, within `SEARCH` points down or up and 8 across:
-/// the peaks of a coarse correlation, strongest first.
-fn candidates(render: &GrayImage, scan: &GrayImage, [tx, ty, tw, th]: [u32; 4]) -> Vec<Candidate> {
+/// the peaks of a coarse correlation over the line's [`template`], strongest first.
+fn candidates(render: &GrayImage, scan: &GrayImage, strip: [u32; 4]) -> Vec<Candidate> {
     let (wy, wx) = ((SEARCH * K) as i32, (8.0 * K) as i32);
+    let t = template(render, widest(render, strip), 2);
+    // The line's start: the leftmost letter.
+    let ox = t.iter().map(|p| p.0).min().unwrap_or(strip[0]);
     let curve: Vec<Candidate> = (-wy..=wy)
         .step_by(2)
         .map(|dy| {
-            (-wx..=wx)
-                .step_by(4)
-                .map(|dx| Candidate { dy, dx, score: ncc(render, tx, ty, tw, th, scan, dx, dy, 3), scale: 1.0 })
-                .fold(Candidate { dy, dx: 0, score: f32::MIN, scale: 1.0 }, |a, b| if b.score > a.score { b } else { a })
+            let mut best = Candidate { dy, dx: 0, score: f32::MIN, scale: 1.0 };
+            for wide in WIDTHS {
+                for dx in (-wx..=wx).step_by(4) {
+                    let score = ncc_wide(&t, scan, dx, dy, wide, ox);
+                    if score > best.score {
+                        best = Candidate { dy, dx, score, scale: wide };
+                    }
+                }
+            }
+            best
         })
         .collect();
     let mut peaks: Vec<Candidate> = (0..curve.len())
@@ -309,19 +348,23 @@ fn candidates(render: &GrayImage, scan: &GrayImage, [tx, ty, tw, th]: [u32; 4]) 
         .map(|i| curve[i])
         .collect();
     peaks.sort_by(|a, b| b.score.total_cmp(&a.score));
-    peaks.truncate(6);
+    // Look-alike rows give many near-equal places; the true one must survive to the choice.
+    peaks.truncate(16);
     peaks
 }
 
 /// A candidate polished to the pixel.
 fn refine(render: &GrayImage, scan: &GrayImage, m: &Mark, strip: [u32; 4], c: Candidate) -> Offset {
-    let [tx, ty, tw, th] = strip;
+    let t = template(render, widest(render, strip), 1);
+    let ox = t.iter().map(|p| p.0).min().unwrap_or(strip[0]);
     let mut best = (f32::MIN, c.dx, c.dy);
-    for dy in (c.dy - 3)..=(c.dy + 3) {
-        for dx in (c.dx - 3)..=(c.dx + 3) {
-            let v = ncc(render, tx, ty, tw, th, scan, dx, dy, 1);
-            if v > best.0 {
-                best = (v, dx, dy);
+    for wide in [c.scale - 0.03, c.scale - 0.015, c.scale, c.scale + 0.015, c.scale + 0.03] {
+        for dy in (c.dy - 3)..=(c.dy + 3) {
+            for dx in (c.dx - 3)..=(c.dx + 3) {
+                let v = ncc_wide(&t, scan, dx, dy, wide, ox);
+                if v > best.0 {
+                    best = (v, dx, dy);
+                }
             }
         }
     }
@@ -338,15 +381,19 @@ fn refine(render: &GrayImage, scan: &GrayImage, m: &Mark, strip: [u32; 4], c: Ca
 /// the list as a whole is expected near (that of the nearest line placed above it): the first
 /// line chosen pays for straying from it.
 fn align(lines: &[(f32, Vec<Candidate>, f32)], start: i32) -> Vec<Option<Candidate>> {
-    // Per point of change in offset from one chosen line to the next, and from `start`.
+    // Per point of change in offset from one chosen line to the next, and from `start` (the
+    // first line chosen pays STRAY, every line DRIFT: a whole run of look-alike rows matched a
+    // row or two off agrees with itself, so only distance from where the list belongs tells).
     const JUMP: f32 = 0.003;
     const STRAY: f32 = 0.006;
+    const DRIFT: f32 = 0.002;
     let mut best: Vec<Vec<(f32, Option<(usize, usize)>)>> = vec![];
     for (i, (y, cands, floor)) in lines.iter().enumerate() {
         let mut row = vec![];
         for c in cands {
             let at = y + c.dy as f32 / K;
-            let mut total = (c.score - floor - STRAY * (c.dy - start).abs() as f32 / K, None);
+            let own = c.score - floor - DRIFT * (c.dy - start).abs() as f32 / K;
+            let mut total = (own - STRAY * (c.dy - start).abs() as f32 / K, None);
             for (j, (yj, prev, _)) in lines[..i].iter().enumerate() {
                 // At least a third of the drawn distance apart, and 4 points.
                 let gap = ((y - yj) * 0.3).max(4.0);
@@ -354,7 +401,7 @@ fn align(lines: &[(f32, Vec<Candidate>, f32)], start: i32) -> Vec<Option<Candida
                     if at - (yj + p.dy as f32 / K) < gap {
                         continue;
                     }
-                    let t = best[j][q].0 + c.score - floor - JUMP * (c.dy - p.dy).abs() as f32 / K;
+                    let t = best[j][q].0 + own - JUMP * (c.dy - p.dy).abs() as f32 / K;
                     if t > total.0 {
                         total = (t, Some((j, q)));
                     }
@@ -445,6 +492,16 @@ pub struct Column {
     pub score: f32,
 }
 
+/// The widest inked stretch of a line's strip (see [`clusters`]): a line is found by it, since
+/// where its other pieces sit depends on tab stops the fit may not have put right yet.
+fn widest(render: &GrayImage, strip: [u32; 4]) -> [u32; 4] {
+    let pad = (2.0 * K) as u32;
+    match clusters(render, strip).into_iter().max_by_key(|c| c.1 - c.0) {
+        Some((a, b)) => [a.saturating_sub(pad), strip[1], b - a + 2 * pad, strip[3]],
+        None => strip,
+    }
+}
+
 /// The inked stretches of a strip of the rendering, split at gaps wider than 14 points.
 fn clusters(render: &GrayImage, [tx, ty, tw, th]: [u32; 4]) -> Vec<(u32, u32)> {
     let gap = (14.0 * K) as u32;
@@ -503,7 +560,8 @@ fn ncc_stretched(render: &GrayImage, scan: &GrayImage, (a, b): (u32, u32), [_, t
 fn columns_of(render: &GrayImage, scan: &GrayImage, o: &Offset) -> Vec<Column> {
     let dy = (o.dy * K).round() as i32;
     let base = (o.dx * K).round() as i32;
-    let wx = (8.0 * K) as i32;
+    // Wide: a column after a tab may be well off where it belongs until its tab stop is set.
+    let wx = (20.0 * K) as i32;
     clusters(render, o.strip)
         .into_iter()
         .map(|c| {
@@ -771,6 +829,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
         };
         let mut c = vec![];
         let mut sure;
+        let mut placed_by_shape = false;
         if figure {
             sure = o.score >= SURE_FIGURE;
         } else {
@@ -787,6 +846,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
                     let centred = matches!(b, Block::P(p) if p.align == Align::Center);
                     c = if centred { span_ratio(&render, &scan_page, &o).map(|r| vec![r]).unwrap_or_default() } else { vec![] };
                     sure = true;
+                    placed_by_shape = true;
                 }
             }
         }
@@ -805,7 +865,11 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
             );
         }
         if sure {
-            guesses.insert(list_of(i), o.dy);
+            // Only a line matched letter for letter sets where the next one placed by shape
+            // starts looking: placed from each other, a run of them would wander off.
+            if chosen[k].is_some() && !placed_by_shape {
+                guesses.insert(list_of(i), o.dy);
+            }
             found[i] = Some(o);
             columns[i] = c;
         } else {
@@ -1041,9 +1105,30 @@ fn shift(list: &mut Vec<Block>, k: usize, d: f32) {
         _ => {}
     }
 }
+/// Takes `d` (negative) points out from under block `i`: its space after first, then, for a
+/// paragraph, its line height (set exactly, down to 0.9 of its type), so lines set further
+/// apart than on the scan can close up.
 fn take_after(list: &mut [Block], i: usize, d: f32) {
     match &mut list[i] {
-        Block::P(p) => p.after = (p.after + d).max(0.0),
+        Block::P(p) => {
+            let room = p.after + d;
+            p.after = room.max(0.0);
+            if room < 0.0 {
+                let size = p
+                    .runs
+                    .iter()
+                    .filter_map(|r| match r {
+                        Run::Text(t) => t.size,
+                        Run::Math { size, .. } => *size,
+                        _ => None,
+                    })
+                    .fold(0.0f32, f32::max)
+                    .max(8.0);
+                // Single spacing is about 1.15 of the type in the common faces.
+                let line = p.line.unwrap_or(size * 1.15);
+                p.line = Some((line + room).max(size * 0.9));
+            }
+        }
         Block::Space { height } => *height = (*height + d).max(1.0),
         _ => {}
     }
@@ -1279,6 +1364,30 @@ mod tests {
     }
 
     #[test]
+    fn writing_beside_a_line_does_not_spoil_its_match() {
+        // A printed bar, and the scan with the same bar 4 px lower and a scribble beside it.
+        let mut r = GrayImage::from_pixel(120, 40, Luma([255]));
+        let mut s = GrayImage::from_pixel(120, 40, Luma([255]));
+        for x in 10..50 {
+            for y in 15..18 {
+                r.put_pixel(x, y, Luma([0]));
+                s.put_pixel(x, y + 4, Luma([0]));
+            }
+        }
+        for x in 60..115 {
+            for y in 5..35 {
+                if (x + y) % 3 == 0 {
+                    s.put_pixel(x, y, Luma([40]));
+                }
+            }
+        }
+        let t = template(&r, [0, 5, 120, 30], 1);
+        let at = ncc_wide(&t, &s, 0, 4, 1.0, 0);
+        assert!(at > 0.9, "{at}");
+        assert!(ncc_wide(&t, &s, 0, 0, 1.0, 0) < 0.3);
+    }
+
+    #[test]
     fn markers_are_read_from_pdftotext() {
         // docx::marker('B', 12) is "QBbmZ"; its letters arrive in any order.
         assert_eq!(docx::marker('B', 12), "QBbmZ");
@@ -1300,6 +1409,17 @@ mod tests {
         shift(&mut blocks, 1, -10.0);
         let (Block::P(a), Block::P(b)) = (&blocks[0], &blocks[1]) else { panic!() };
         assert_eq!((a.after, b.before), (14.0, 0.0));
+    }
+
+    #[test]
+    fn lines_set_too_far_apart_close_up() {
+        let text = Run::Text(Text { text: "x".into(), size: Some(10.0), ..Default::default() });
+        let p = |before: f32| Block::P(Para { before, runs: vec![text.clone()], ..Default::default() });
+        let mut blocks = vec![p(0.0), p(1.0)];
+        // Up 3 points: 1 from the space before, 2 from the line above (11.5 pt single spacing).
+        shift(&mut blocks, 1, -3.0);
+        let (Block::P(a), Block::P(b)) = (&blocks[0], &blocks[1]) else { panic!() };
+        assert_eq!((b.before, a.line), (0.0, Some(9.5)));
     }
 
     #[test]
@@ -1345,8 +1465,9 @@ mod tests {
             t.put_pixel(x, 10, Luma([0]));
             s.put_pixel(x + 3, 14, Luma([0]));
         }
-        let at = ncc(&t, 0, 5, 60, 10, &s, 3, 4, 1);
-        let off = ncc(&t, 0, 5, 60, 10, &s, 0, 0, 1);
+        let tpl = template(&t, [0, 5, 60, 10], 1);
+        let at = ncc_wide(&tpl, &s, 3, 4, 1.0, 0);
+        let off = ncc_wide(&tpl, &s, 0, 0, 1.0, 0);
         assert!(at > 0.9 && off < 0.2, "{at} {off}");
     }
 }
