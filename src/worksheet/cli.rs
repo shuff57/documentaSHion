@@ -7,7 +7,8 @@
 //! documentashion ws compare <scan.png> <doc.docx> <out.png> [--shear S] scan and rebuild overlaid
 //! documentashion ws fit     <scan.png> <sheet.json> [--rounds N]      line the rebuild up with the scan
 //! documentashion ws review  <scan.png> <sheet.json>                   a second look for missing print
-//! documentashion ws graphs  <scan.png> <sheet.json> [--shear S]       read each graph again, close up
+//! documentashion ws graphs  <scan.png> <sheet.json> [--shear S] [--only check|score]
+//!                                                 read each graph again, close up, and check it
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
 //! documentashion ws page    <project id> <page n> [out.docx]            a project's page, as the app does it
 //! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
@@ -89,8 +90,16 @@ pub fn main(args: &[String]) -> Result<(), String> {
             let path = Path::new(arg(2)?);
             let mut sheet = load(path)?;
             let shear = flag("--shear").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let n = graphs::reread(Path::new(arg(1)?), &mut sheet, shear, ask)?;
-            eprintln!("read {n} graphs again");
+            // `--only check`: just the check of the graphs as they are; `--only score`: just
+            // how well each lies on its print.
+            match flag("--only").as_deref() {
+                Some("check") => graphs::check_scan(Path::new(arg(1)?), &mut sheet, shear, ask).map(|n| eprintln!("improved {n} graphs"))?,
+                Some("score") => graphs::check_scan(Path::new(arg(1)?), &mut sheet, shear, &|_: &str, _: &str| Ok("{}".to_string())).map(|_| ())?,
+                _ => {
+                    let n = graphs::reread(Path::new(arg(1)?), &mut sheet, shear, ask)?;
+                    eprintln!("read {n} graphs again");
+                }
+            }
             save(&sheet, path)
         }
         "rebuild" => {
@@ -156,6 +165,16 @@ pub fn rebuild(scan: &Path, out: &Path, ask: Ask, turn: bool, stop: &std::sync::
         save(&sheet, &json)?;
         report = fit::fit(&page, &mut sheet, 10)?;
         save(&sheet, &json)?;
+    }
+    // Then each graph, placed, is laid over its print, and one that doesn't line up is looked
+    // at again.
+    if graphs > 0 {
+        stopped()?;
+        if graphs::check_scan(&page, &mut sheet, report.shear, ask)? > 0 {
+            save(&sheet, &json)?;
+            report = fit::fit(&page, &mut sheet, 10)?;
+            save(&sheet, &json)?;
+        }
     }
     build(&sheet, out)?;
     Ok(report)

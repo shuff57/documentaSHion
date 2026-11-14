@@ -650,6 +650,9 @@ pub struct Measure {
     /// The first header and footer anchor's offsets.
     pub head: Option<Offset>,
     pub foot: Option<Offset>,
+    /// The sheet as drawn (the first page, 150 dpi) and the scan at the same size.
+    pub render: GrayImage,
+    pub scan: GrayImage,
 }
 
 /// The box of a figure drawn with marker `m`: an inline picture stands on the line's baseline,
@@ -985,7 +988,7 @@ fn measure_with(scan: &GrayImage, sheet: &Sheet, words: &[seed::Word]) -> Result
         drawn[i] = Some(strip);
     }
     let agreement = agreement(&render, &scan_page);
-    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, spill, head, foot })
+    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, spill, head, foot, render, scan: scan_page })
 }
 
 /// Letters and digits on a paragraph's first line (an equation counts about half its source).
