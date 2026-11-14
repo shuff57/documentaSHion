@@ -6,6 +6,7 @@
 //! documentashion ws render  <doc.docx> <out.png>                      draw it with WordCraft
 //! documentashion ws compare <scan.png> <doc.docx> <out.png> [--shear S] scan and rebuild overlaid
 //! documentashion ws fit     <scan.png> <sheet.json> [--rounds N]      line the rebuild up with the scan
+//! documentashion ws review  <scan.png> <sheet.json>                   a second look for missing print
 //! documentashion ws graphs  <scan.png> <sheet.json> [--shear S]       read each graph again, close up
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
 //! documentashion ws page    <project id> <page n> [out.docx]            a project's page, as the app does it
@@ -17,7 +18,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|graphs|upright|page|rebuild …";
+const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|review|graphs|upright|page|rebuild …";
 
 pub fn main(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -62,6 +63,13 @@ pub fn main(args: &[String]) -> Result<(), String> {
             save(&sheet, path)
         }
         "upright" => upright(Path::new(arg(1)?), Path::new(arg(2)?)).map(|_| ()),
+        "review" => {
+            let path = Path::new(arg(2)?);
+            let mut sheet = load(path)?;
+            let n = extract::review(Path::new(arg(1)?), &mut sheet, ask)?;
+            eprintln!("the review corrected {n} blocks");
+            save(&sheet, path)
+        }
         "page" => {
             // A page of a project, exactly as the app's Word copy does it.
             let dir = crate::model::root().join("projects").join(arg(1)?);
@@ -126,9 +134,24 @@ pub fn rebuild(scan: &Path, out: &Path, ask: Ask, turn: bool, stop: &std::sync::
     let mut report = fit::fit(&page, &mut sheet, 10)?;
     save(&sheet, &json)?;
     stopped()?;
+    // A second look, at the scan beside the rebuild: printed content the first reading missed
+    // or got wrong. Its corrections are fitted with the graphs below.
+    let fixed = match extract::review(&page, &mut sheet, ask) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("review: {e}");
+            0
+        }
+    };
+    if fixed > 0 {
+        eprintln!("the review corrected {fixed} blocks");
+        save(&sheet, &json)?;
+    }
+    stopped()?;
     // Graphs are read again close up once the fit has found them on the scan, then fitted again
     // as redrawn.
-    if graphs::reread(&page, &mut sheet, report.shear, ask)? > 0 {
+    let graphs = graphs::reread(&page, &mut sheet, report.shear, ask)?;
+    if graphs > 0 || fixed > 0 {
         stopped()?;
         save(&sheet, &json)?;
         report = fit::fit(&page, &mut sheet, 10)?;

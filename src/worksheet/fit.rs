@@ -102,8 +102,9 @@ struct Mark {
     y: f32,
 }
 
-/// Draws the sheet with markers; returns the page image at 150 dpi and the markers.
-fn probe(sheet: &Sheet) -> Result<(GrayImage, Vec<Mark>), String> {
+/// Draws the sheet with markers; returns the first page's image at 150 dpi, its markers and how
+/// many pages the sheet ran to.
+fn probe(sheet: &Sheet) -> Result<(GrayImage, Vec<Mark>, usize), String> {
     let docx = super::cli::tmp("probe.docx");
     docx::write_as(sheet, &docx, &super::cli::figure_png, true)?;
     let pdf = docx.with_extension("pdf");
@@ -111,8 +112,12 @@ fn probe(sheet: &Sheet) -> Result<(GrayImage, Vec<Mark>), String> {
     if !out.status.success() {
         return Err(format!("wordcraft-cli convert: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
-    let bbox = Command::new("pdftotext").args(["-bbox", "-f", "1", "-l", "1"]).arg(&pdf).arg("-").output().map_err(|e| format!("pdftotext: {e}"))?;
-    let marks = parse_marks(&String::from_utf8_lossy(&bbox.stdout));
+    let bbox = Command::new("pdftotext").arg("-bbox").arg(&pdf).arg("-").output().map_err(|e| format!("pdftotext: {e}"))?;
+    let text = String::from_utf8_lossy(&bbox.stdout);
+    let pages = text.matches("<page ").count().max(1);
+    // Markers of the first page only: coordinates start again on each page.
+    let first = text.split("</page>").next().unwrap_or("");
+    let marks = parse_marks(first);
     let stem = docx.with_extension("");
     let out = Command::new("pdftoppm")
         .args(["-r", "150", "-gray", "-png", "-singlefile", "-f", "1", "-l", "1"])
@@ -125,7 +130,7 @@ fn probe(sheet: &Sheet) -> Result<(GrayImage, Vec<Mark>), String> {
     }
     let png = stem.with_extension("png");
     let img = image::open(&png).map_err(|e| format!("{}: {e}", png.display()))?.to_luma8();
-    Ok((img, marks))
+    Ok((img, marks, pages))
 }
 
 /// Markers ([`docx::marker`]) in `pdftotext -bbox` output. A marker is set with no advance,
@@ -610,6 +615,8 @@ pub struct Measure {
     /// The first header and footer anchor's offsets.
     /// How much of the rebuild's printed ink lands on ink in the scan (see [`agreement`]).
     pub agreement: f32,
+    /// Pages the sheet ran to as drawn.
+    pub pages: usize,
     pub head: Option<Offset>,
     pub foot: Option<Offset>,
 }
@@ -749,7 +756,7 @@ fn figure_refine(render: &GrayImage, scan: &GrayImage, m: &Mark, strip: [u32; 4]
 
 /// One measuring pass over the sheet as it stands.
 pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
-    let (render, marks) = probe(sheet)?;
+    let (render, marks, pages) = probe(sheet)?;
     let scan_page = if scan.dimensions() == render.dimensions() {
         scan.clone()
     } else {
@@ -895,7 +902,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
         drawn[i] = Some(strip);
     }
     let agreement = agreement(&render, &scan_page);
-    Ok(Measure { anchors, found, columns, scales, drawn, agreement, head, foot })
+    Ok(Measure { anchors, found, columns, scales, drawn, agreement, pages, head, foot })
 }
 
 /// The share of the rebuild's ink that lands on ink in the scan, give or take a pixel. Only the
@@ -1158,6 +1165,30 @@ fn take_after(list: &mut [Block], i: usize, d: f32) {
     }
 }
 
+/// Scales the vertical space of `blocks` by `k`: space before and after, spacers, and table row
+/// heights, inside tables too.
+fn squeeze(blocks: &mut [Block], k: f32) {
+    for b in blocks {
+        match b {
+            Block::P(p) => {
+                p.before *= k;
+                p.after *= k;
+            }
+            Block::Figure(f) => f.before *= k,
+            Block::Space { height } => *height = (*height * k).max(1.0),
+            Block::Table(t) => {
+                for r in &mut t.rows {
+                    r.height = r.height.map(|h| h * k);
+                    for c in &mut r.cells {
+                        squeeze(&mut c.blocks, k);
+                    }
+                }
+            }
+            Block::Break => {}
+        }
+    }
+}
+
 /// How far the scan leans, points across per point down, from how line starts drift across
 /// further down the page (`(y, dx)` pairs; a least-squares line); `None` with too few lines
 /// spread over too little of the page.
@@ -1228,7 +1259,18 @@ pub fn fit(scan: &Path, sheet: &mut Sheet, rounds: usize) -> Result<Report, Stri
     // the best state seen, not the last.
     let mut best: Option<(f32, Sheet, Report)> = None;
     for round in 0..rounds {
-        let Measure { anchors, found, columns, scales, head, foot, agreement, .. } = measure(&page, sheet)?;
+        let Measure { anchors, found, columns, scales, head, foot, agreement, pages, .. } = measure(&page, sheet)?;
+        // A one-page worksheet that runs onto a second page has lost what went over: make room
+        // before anything else (the bottom margin first, then all the space down the page).
+        if pages > 1 && !sheet.blocks.iter().any(|b| matches!(b, Block::Break)) {
+            if sheet.page.margins[2] > 20.0 {
+                sheet.page.margins[2] = (sheet.page.margins[2] * 0.5).max(18.0);
+            } else {
+                squeeze(&mut sheet.blocks, 0.85);
+            }
+            eprintln!("fit round {}: the sheet ran onto {pages} pages; made room", round + 1);
+            continue;
+        }
         let block = |i: usize| super::block_at(&sheet.blocks, &anchors[i]);
         // Where left-aligned body lines start on the scan against the rebuild: the steadiest
         // horizontal reading, since a line's width depends on the font as well.

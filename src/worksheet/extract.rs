@@ -106,3 +106,98 @@ pub fn parse(reply: &str) -> Result<Sheet, String> {
     sheet.normalize();
     Ok(sheet)
 }
+
+const REVIEW: &str = r#"Left: a scanned, printed school worksheet. Right: our rebuild of its PRINTED content, drawn from the worksheet below.
+Compare them. Find PRINTED content on the left that is missing on the right, or printed wrong (wrong words, numbers or symbols, a missing table row or column, a missing rule, blank or graph). Ignore everything handwritten, stamps and scanner marks, and ignore small differences of font, size or position.
+The rebuild's top-level blocks, numbered:
+{BLOCKS}
+Return ONLY a JSON object: {"edits":[...]} where each edit is either
+  {"replace": n, "block": {...}}   a whole corrected block n (for a table, the whole table with every row), or
+  {"insert_after": n, "block": {...}}   a missing block (n = -1 for the very top).
+Blocks use the same JSON as above. Return {"edits":[]} if nothing printed is missing or wrong."#;
+
+/// A correction the review asks for.
+#[derive(Debug, Deserialize)]
+pub struct Correction {
+    #[serde(default)]
+    pub replace: Option<usize>,
+    #[serde(default)]
+    pub insert_after: Option<i64>,
+    pub block: Block,
+}
+
+/// Shows the model the scan beside the sheet as built and applies the printed content it finds
+/// missing or wrong. Returns how many corrections were made.
+pub fn review(scan: &Path, sheet: &mut Sheet, ask: Ask) -> Result<usize, String> {
+    let docx = super::cli::tmp("review.docx");
+    super::cli::build(sheet, &docx)?;
+    let png = super::cli::render(&docx, &super::cli::tmp("review.png"), 0)?;
+    let ours = image::open(&png).map_err(|e| e.to_string())?.to_rgb8();
+    let page = image::open(scan).map_err(|e| format!("{}: {e}", scan.display()))?;
+    let theirs = page.resize(ours.width() * 2, ours.height(), image::imageops::FilterType::Triangle).resize_exact(ours.width(), ours.height(), image::imageops::FilterType::Triangle).to_rgb8();
+    let mut both = image::RgbImage::from_pixel(ours.width() * 2 + 20, ours.height(), image::Rgb([128, 128, 128]));
+    image::imageops::replace(&mut both, &theirs, 0, 0);
+    image::imageops::replace(&mut both, &ours, ours.width() as i64 + 20, 0);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(both).write_to(&mut bytes, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+    let blocks: String = sheet
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| format!("{i}: {}\n", serde_json::to_string(b).unwrap_or_default()))
+        .collect();
+    let reply = ask(&REVIEW.replace("{BLOCKS}", &blocks), &b64)?;
+    let (a, b) = (reply.find('{').ok_or("The review held no answer.")?, reply.rfind('}').ok_or("The review held no answer.")?);
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(default)]
+        edits: Vec<Correction>,
+    }
+    let r: Reply = serde_json::from_str(&reply[a..=b]).map_err(|e| format!("The review didn't parse: {e}"))?;
+    Ok(apply_corrections(sheet, r.edits))
+}
+
+/// Applies review corrections, last place first so earlier numbers still point where they did.
+pub fn apply_corrections(sheet: &mut Sheet, mut edits: Vec<Correction>) -> usize {
+    let at = |c: &Correction| c.replace.map(|n| n as i64).or(c.insert_after).unwrap_or(-2);
+    edits.sort_by_key(|c| std::cmp::Reverse(at(c)));
+    let mut n = 0;
+    for c in edits {
+        if let Some(i) = c.replace.filter(|&i| i < sheet.blocks.len()) {
+            sheet.blocks[i] = c.block;
+            n += 1;
+        } else if let Some(i) = c.insert_after.filter(|&i| i >= -1 && i < sheet.blocks.len() as i64) {
+            sheet.blocks.insert((i + 1) as usize, c.block);
+            n += 1;
+        }
+    }
+    sheet.normalize();
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrections_apply_from_the_bottom_up() {
+        let mut s: Sheet = serde_json::from_str(r#"{"blocks":[{"type":"p","runs":[{"text":"a"}]},{"type":"p","runs":[{"text":"b"}]}]}"#).unwrap();
+        let edits: Vec<Correction> = serde_json::from_str(
+            r#"[{"insert_after":-1,"block":{"type":"p","runs":[{"text":"top"}]}},
+                {"replace":1,"block":{"type":"p","runs":[{"text":"B"}]}},
+                {"insert_after":1,"block":{"type":"p","runs":[{"text":"end"}]}}]"#,
+        )
+        .unwrap();
+        assert_eq!(apply_corrections(&mut s, edits), 3);
+        let text: Vec<String> = s
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::P(p) => p.runs.iter().map(|r| if let Run::Text(t) = r { t.text.clone() } else { String::new() }).collect(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(text, ["top", "a", "B", "end"]);
+    }
+}
