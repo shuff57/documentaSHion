@@ -246,9 +246,9 @@ pub struct Offset {
     strip: [u32; 4],
 }
 
-/// Finds the first line of the block whose marker is `m` in the scan, starting the search
-/// `guess` points below where it was drawn.
-fn locate(render: &GrayImage, scan: &GrayImage, m: &Mark, size: f32, guess: f32, sheet: &Sheet) -> Option<Offset> {
+/// Finds the first line of the block whose marker is `m` in the scan, searching `reach` points
+/// either side of `guess` points below where it was drawn.
+fn locate(render: &GrayImage, scan: &GrayImage, m: &Mark, size: f32, guess: f32, reach: f32, sheet: &Sheet) -> Option<Offset> {
     let size = size.max(6.0);
     let top = ((m.y - size * 0.95) * K).max(0.0) as u32;
     let bottom = ((m.y + size * 0.3) * K) as u32;
@@ -267,9 +267,9 @@ fn locate(render: &GrayImage, scan: &GrayImage, m: &Mark, size: f32, guess: f32,
     if inked < 40 {
         return None;
     }
-    // Coarse search every 2 px over ±30 pt down and ±8 pt across, then refine by 1 px.
+    // Coarse search every 2 px over ±`reach` down and ±8 pt across, then refine by 1 px.
     let g = (guess * K).round() as i32;
-    let (wy, wx) = ((30.0 * K) as i32, (8.0 * K) as i32);
+    let (wy, wx) = ((reach * K).max(2.0) as i32, (8.0 * K) as i32);
     let mut best = (f32::MIN, 0, 0);
     for dy in ((g - wy)..=(g + wy)).step_by(2) {
         for dx in (-wx..=wx).step_by(2) {
@@ -295,10 +295,10 @@ fn locate(render: &GrayImage, scan: &GrayImage, m: &Mark, size: f32, guess: f32,
 
 /// A line whose glyphs don't match the scan (another font) can still be placed by its shape
 /// down the page: the ink per row across its width, correlated against the scan's within
-/// ±30 points of `guess`. Returns the offset down, points, and the correlation.
-fn band(render: &GrayImage, scan: &GrayImage, o: &Offset, guess: f32) -> Option<(f32, f32)> {
+/// ±`reach` points of `guess`. Returns the offset down, points, and the correlation.
+fn band(render: &GrayImage, scan: &GrayImage, o: &Offset, guess: f32, reach: f32) -> Option<(f32, f32)> {
     let [tx, ty, tw, th] = o.strip;
-    let pad = (30.0 * K) as i32;
+    let pad = (reach * K).max(2.0) as i32;
     let row = |img: &GrayImage, y: i32| -> f32 {
         if y < 0 || y as u32 >= img.height() {
             return 0.0;
@@ -472,9 +472,13 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
     let mut body = vec![None; sheet.blocks.len()];
     let mut columns = vec![vec![]; sheet.blocks.len()];
     let mut guess = 0.0;
+    // Where the last line found was drawn: the next is looked for within less than half the
+    // distance to it, so a list of look-alike rows can't be matched a row off.
+    let mut last_y: Option<f32> = None;
     for m in marks.iter().filter(|m| m.part == 'B') {
         let Some(b) = sheet.blocks.get(m.index) else { continue };
-        let Some(o) = locate(&render, &scan_page, m, first_size(b, sheet), guess, sheet) else { continue };
+        let reach = last_y.map(|y| ((m.y - y) * 0.45).clamp(3.0, 30.0)).unwrap_or(30.0);
+        let Some(o) = locate(&render, &scan_page, m, first_size(b, sheet), guess, reach, sheet) else { continue };
         // The columns are matched allowing for a different type size, so they can vouch for a
         // line whose whole-width match is weak because its text runs wider or narrower.
         let c = columns_of(&render, &scan_page, &o);
@@ -485,7 +489,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
         if !sure {
             // Placed by shape instead; its glyphs can't be matched, but a centred line's width
             // still can: it scales the type so the line spans what it spans on the scan.
-            if let Some((dy, score)) = band(&render, &scan_page, &o, guess).filter(|b| b.1 >= 0.8) {
+            if let Some((dy, score)) = band(&render, &scan_page, &o, guess, reach).filter(|b| b.1 >= 0.8) {
                 o = Offset { dy, dx: 0.0, score, ..o };
                 let centred = matches!(b, Block::P(p) if p.align == Align::Center);
                 c = if centred { span_ratio(&render, &scan_page, &o).map(|r| vec![r]).unwrap_or_default() } else { vec![] };
@@ -506,6 +510,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
         }
         if sure {
             guess = o.dy;
+            last_y = Some(m.y);
             body[m.index] = Some(o);
             columns[m.index] = c;
         }
@@ -514,7 +519,7 @@ pub fn measure(scan: &GrayImage, sheet: &Sheet) -> Result<Measure, String> {
         marks
             .iter()
             .find(|m| m.part == part && m.index == 0)
-            .and_then(|m| locate(&render, &scan_page, m, blocks.first().map(|b| first_size(b, sheet)).unwrap_or(0.0), 0.0, sheet))
+            .and_then(|m| locate(&render, &scan_page, m, blocks.first().map(|b| first_size(b, sheet)).unwrap_or(0.0), 0.0, 30.0, sheet))
             .filter(|o| o.score >= SURE)
     };
     let (head, foot) = (edge('H', &sheet.header), edge('F', &sheet.footer));
