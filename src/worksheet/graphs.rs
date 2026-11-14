@@ -4,7 +4,7 @@
 use super::{fit, *};
 use base64::Engine;
 use image::DynamicImage;
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
 /// Where a figure is in the sheet (see [`super::Path`]).
 type At = super::Path;
@@ -70,7 +70,7 @@ fn crop(scan: &Path, bx: [f32; 4], page: &PageSetup, sure: bool) -> Result<Dynam
 }
 
 /// The verSHion parameters the model reads off one graph's crop.
-fn read(crop: &DynamicImage, f: &Figure, model: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+fn read(crop: &DynamicImage, f: &Figure, ask: Ask) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let id = f.vershion.as_deref().unwrap_or("coordinate-grid");
     let params = super::extract::describe(&[id]);
     let prompt = PROMPT
@@ -80,7 +80,7 @@ fn read(crop: &DynamicImage, f: &Figure, model: &str) -> Result<serde_json::Map<
     let mut png = std::io::Cursor::new(Vec::new());
     crop.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-    let reply = crate::claude::chat(model, &prompt, &b64, Duration::from_secs(600))?;
+    let reply = ask(&prompt, &b64)?;
     let (a, b) = (reply.find('{').ok_or("The model's reply held no settings.")?, reply.rfind('}').ok_or("The model's reply held no settings.")?);
     let v: serde_json::Value = serde_json::from_str(&reply[a..=b]).map_err(|e| format!("The model's graph settings didn't parse: {e}"))?;
     v.as_object().cloned().ok_or_else(|| "The model's graph settings weren't an object.".into())
@@ -89,7 +89,7 @@ fn read(crop: &DynamicImage, f: &Figure, model: &str) -> Result<serde_json::Map<
 /// Reads every verSHion figure of `sheet` again from its crop of `scan` (the upright scan the
 /// sheet is fitted to, sheared by `shear`), several at once. Returns how many were read; a
 /// figure that fails keeps its settings, and the failures are reported.
-pub fn reread(scan: &Path, sheet: &mut Sheet, shear: f32, model: &str) -> Result<usize, String> {
+pub fn reread(scan: &Path, sheet: &mut Sheet, shear: f32, ask: Ask) -> Result<usize, String> {
     let (w, h) = ((sheet.page.width * fit::K).round() as u32, (sheet.page.height * fit::K).round() as u32);
     let page = fit::prepare_scan(scan, w, h, shear)?;
     let found = boxes(&page, sheet)?;
@@ -115,7 +115,7 @@ pub fn reread(scan: &Path, sheet: &mut Sheet, shear: f32, model: &str) -> Result
         }
     }
     let results: Vec<(At, Result<serde_json::Map<String, serde_json::Value>, String>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = jobs.iter().map(|(p, f, c)| (p.clone(), s.spawn(move || read(c, f, model)))).collect();
+        let handles: Vec<_> = jobs.iter().map(|(p, f, c)| (p.clone(), s.spawn(move || read(c, f, ask)))).collect();
         handles.into_iter().map(|(p, h)| (p, h.join().unwrap_or_else(|_| Err("crashed".into())))).collect()
     });
     let mut n = 0;

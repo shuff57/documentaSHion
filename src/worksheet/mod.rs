@@ -15,6 +15,10 @@ pub mod orient;
 
 use serde::{Deserialize, Serialize};
 
+/// Asks the vision model one thing about one image (base64 PNG) and returns its reply: Claude
+/// through the CLI from a terminal, the provider set in Settings from the app.
+pub type Ask<'a> = &'a (dyn Fn(&str, &str) -> Result<String, String> + Sync);
+
 /// One printed page.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sheet {

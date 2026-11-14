@@ -2,7 +2,7 @@
 //! Claude Code CLI), as a [`Sheet`].
 use super::*;
 use base64::Engine;
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
 /// The verSHion figures a math worksheet uses; their parameters are listed in the prompt.
 const FIGURES: [&str; 2] = ["coordinate-grid", "number-line"];
@@ -83,15 +83,15 @@ pub fn describe(ids: &[&str]) -> String {
     s
 }
 
-/// Reads `scan` with Claude `model` and returns the worksheet. The reply is kept beside the
+/// Reads `scan` with the model and returns the worksheet. The reply is kept beside the
 /// scratch files for checking.
-pub fn extract(scan: &Path, model: &str) -> Result<Sheet, String> {
+pub fn extract(scan: &Path, ask: Ask) -> Result<Sheet, String> {
     let img = image::open(scan).map_err(|e| format!("{}: {e}", scan.display()))?;
     let img = if img.height() > 2000 { img.resize(1600, 2000, image::imageops::FilterType::Lanczos3) } else { img };
     let mut png = std::io::Cursor::new(Vec::new());
     img.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-    let reply = crate::claude::chat(model, &prompt(img.width(), img.height()), &b64, Duration::from_secs(900))?;
+    let reply = ask(&prompt(img.width(), img.height()), &b64)?;
     let _ = std::fs::write(super::cli::tmp("extract-reply.txt"), &reply);
     parse(&reply)
 }

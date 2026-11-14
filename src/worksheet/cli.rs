@@ -8,6 +8,7 @@
 //! documentashion ws fit     <scan.png> <sheet.json> [--rounds N]      line the rebuild up with the scan
 //! documentashion ws graphs  <scan.png> <sheet.json> [--shear S]       read each graph again, close up
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
+//! documentashion ws page    <project id> <page n> [out.docx]            a project's page, as the app does it
 //! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
 //! ```
 use super::*;
@@ -16,7 +17,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|graphs|upright|rebuild …";
+const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|graphs|upright|page|rebuild …";
 
 pub fn main(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -36,6 +37,9 @@ pub fn main(args: &[String]) -> Result<(), String> {
     };
     let arg = |i: usize| pos.get(i).map(|s| s.as_str()).ok_or_else(|| USAGE.to_string());
     let model = flag("--model").unwrap_or_else(|| "opus".into());
+    // From a terminal the model is Claude, through the signed-in CLI.
+    let claude = |prompt: &str, img: &str| crate::claude::chat(&model, prompt, img, std::time::Duration::from_secs(900));
+    let ask: Ask = &claude;
     match arg(0)? {
         "build" => build_file(Path::new(arg(1)?), Path::new(arg(2)?)),
         "render" => render(Path::new(arg(1)?), Path::new(arg(2)?), 0).map(|_| ()),
@@ -46,7 +50,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
             fit::overlay(Path::new(arg(1)?), &png, Path::new(arg(3)?), shear)
         }
         "extract" => {
-            let sheet = extract::extract(Path::new(arg(1)?), &model)?;
+            let sheet = extract::extract(Path::new(arg(1)?), ask)?;
             save(&sheet, Path::new(arg(2)?))
         }
         "fit" => {
@@ -58,17 +62,33 @@ pub fn main(args: &[String]) -> Result<(), String> {
             save(&sheet, path)
         }
         "upright" => upright(Path::new(arg(1)?), Path::new(arg(2)?)).map(|_| ()),
+        "page" => {
+            // A page of a project, exactly as the app's Word copy does it.
+            let dir = crate::model::root().join("projects").join(arg(1)?);
+            let project: crate::model::Project = serde_json::from_slice(&std::fs::read(dir.join("project.json")).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let n: usize = arg(2)?.parse().map_err(|_| USAGE.to_string())?;
+            let p = project.pages.get(n.saturating_sub(1)).ok_or("No such page.")?;
+            let out = pos.get(3).map(PathBuf::from).unwrap_or_else(|| dir.join(format!("page {n}.docx")));
+            let s = crate::model::Settings::load();
+            if s.needs_key() {
+                return Err("This provider needs an API key: use the app.".into());
+            }
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            rebuild_page(p, &dir, &out, &s, "", &stop).map(|r| eprintln!("{}: {r}", out.display()))
+        }
         "graphs" => {
             let path = Path::new(arg(2)?);
             let mut sheet = load(path)?;
             let shear = flag("--shear").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let n = graphs::reread(Path::new(arg(1)?), &mut sheet, shear, &model)?;
+            let n = graphs::reread(Path::new(arg(1)?), &mut sheet, shear, ask)?;
             eprintln!("read {n} graphs again");
             save(&sheet, path)
         }
         "rebuild" => {
             let out = Path::new(arg(2)?);
-            rebuild(Path::new(arg(1)?), out, &model).map(|r| eprintln!("{}: {r}", out.display()))
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            rebuild(Path::new(arg(1)?), out, ask, true, &stop).map(|r| eprintln!("{}: {r}", out.display()))
         }
         _ => Err(USAGE.into()),
     }
@@ -82,29 +102,61 @@ pub fn upright(scan: &Path, out: &Path) -> Result<u8, String> {
     Ok(turns)
 }
 
-/// The whole rebuild of one scanned page: turned upright (kept beside `out` as
+/// The whole rebuild of one scanned page: turned upright when `turn` (kept beside `out` as
 /// `<name>.scan.png`), read, fitted to the scan and written as `out`; the worksheet itself is
-/// kept as `<name>.json`. Returns how well it fits.
-pub fn rebuild(scan: &Path, out: &Path, model: &str) -> Result<fit::Report, String> {
+/// kept as `<name>.json`. `stop` cancels it between steps. Returns how well it fits.
+pub fn rebuild(scan: &Path, out: &Path, ask: Ask, turn: bool, stop: &std::sync::atomic::AtomicBool) -> Result<fit::Report, String> {
+    let stopped = || -> Result<(), String> {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) { Err("Stopped.".into()) } else { Ok(()) }
+    };
     let page = out.with_extension("scan.png");
-    let turns = upright(scan, &page)?;
-    if turns != 0 {
-        eprintln!("turned the page {} degrees", turns as u32 * 90);
+    if turn {
+        let turns = upright(scan, &page)?;
+        if turns != 0 {
+            eprintln!("turned the page {} degrees", turns as u32 * 90);
+        }
+    } else {
+        std::fs::copy(scan, &page).map_err(|e| format!("{}: {e}", page.display()))?;
     }
-    let mut sheet = extract::extract(&page, model)?;
+    stopped()?;
+    let mut sheet = extract::extract(&page, ask)?;
     let json = out.with_extension("json");
     save(&sheet, &json)?;
+    stopped()?;
     let mut report = fit::fit(&page, &mut sheet, 10)?;
     save(&sheet, &json)?;
+    stopped()?;
     // Graphs are read again close up once the fit has found them on the scan, then fitted again
     // as redrawn.
-    if graphs::reread(&page, &mut sheet, report.shear, model)? > 0 {
+    if graphs::reread(&page, &mut sheet, report.shear, ask)? > 0 {
+        stopped()?;
         save(&sheet, &json)?;
         report = fit::fit(&page, &mut sheet, 10)?;
         save(&sheet, &json)?;
     }
     build(&sheet, out)?;
     Ok(report)
+}
+
+/// Rebuilds page `p` of a project as the app does: the page as it is shown (cropped and
+/// straightened; turned the right way up if it still isn't), read by the provider in Settings,
+/// written to `out`. Scratch files go in `dir`.
+pub fn rebuild_page(
+    p: &crate::model::Page,
+    dir: &Path,
+    out: &Path,
+    s: &crate::model::Settings,
+    key: &str,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<fit::Report, String> {
+    let scan = dir.join(format!("{}.worksheet.png", p.id));
+    p.render()?.save(&scan).map_err(|e| e.to_string())?;
+    let model = |prompt: &str, img: &str| crate::services::chat(s, key, prompt, img, true, std::time::Duration::from_secs(900));
+    let r = rebuild(&scan, out, &model, true, stop);
+    // The page images were only needed while rebuilding; the document and its worksheet stay.
+    let _ = std::fs::remove_file(&scan);
+    let _ = std::fs::remove_file(out.with_extension("scan.png"));
+    r
 }
 
 pub fn load(path: &Path) -> Result<Sheet, String> {

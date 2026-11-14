@@ -43,6 +43,8 @@ pub(crate) enum Event {
     Marks(String, Result<Grade, String>),
     /// An answer key read from a page or file, for review.
     AnswerKey(Result<Vec<KeyItem>, String>),
+    /// The page rebuilt as a Word document: where it was saved and how well it fits the scan.
+    Worksheet(Result<(std::path::PathBuf, String), String>),
     Update(Result<update::Status, String>),
     /// The new version was installed and started; this copy should close.
     Updated(Result<(), String>),
@@ -257,6 +259,20 @@ impl App {
             });
         }
     }
+    /// Rebuilds the selected page's printed worksheet as a Word document in the background, with
+    /// the provider set in Settings, and opens it.
+    fn word_copy(&mut self, ctx: &egui::Context) {
+        let Some(n) = (!self.project.pages.is_empty()).then_some(self.selected) else { return };
+        let p = self.project.pages[n].clone();
+        let (s, key) = (self.settings.clone(), self.key.clone());
+        let dir = self.project.dir();
+        let name: String = self.project.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
+        let out = dir.join(format!("{} - page {}.docx", name.trim(), n + 1));
+        self.launch(ctx, move |stop| {
+            let r = crate::worksheet::cli::rebuild_page(&p, &dir, &out, &s, &key, &stop);
+            Event::Worksheet(r.map(|r| (out.clone(), r.to_string())))
+        });
+    }
     /// Marks the selected page's copy again, for example after the key changed.
     fn remark(&mut self, ctx: &egui::Context) {
         let Some(p) = self.project.pages.get(self.selected).cloned() else { return };
@@ -377,6 +393,11 @@ impl App {
                 };
                 self.update = Some(r);
             }
+            Event::Worksheet(Ok((path, report))) => {
+                self.status = format!("Word copy saved: {} · {report}", path.display());
+                open_document(&path);
+            }
+            Event::Worksheet(Err(e)) => self.status = format!("No Word copy: {e}"),
             Event::Updated(Ok(())) => std::process::exit(0),
             Event::Updated(Err(e)) => self.status = e,
             Event::Devices(Ok(s)) => {
@@ -632,4 +653,17 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.draw(ui);
     }
+}
+
+/// Opens a document in OfficeCraft if it is installed, else in the desktop's default app.
+fn open_document(path: &std::path::Path) {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let officecraft = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .chain(home.map(|h| h.join(".local/bin")))
+        .map(|d| d.join("officecraft"))
+        .find(|p| p.is_file());
+    let mut cmd = std::process::Command::new(officecraft.unwrap_or_else(|| "xdg-open".into()));
+    let _ = cmd.arg(path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
 }

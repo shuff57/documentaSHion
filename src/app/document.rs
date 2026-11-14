@@ -594,6 +594,15 @@ impl App {
                 if kit::tertiary(ui, Some(icon::PENCIL_SIMPLE_LINE), "Rewrite").on_hover_text("A clean rewritten version, kept separate from the source").clicked() {
                     task = Some("Rewrite");
                 }
+                if kit::tertiary(ui, Some(icon::FILE_DOC), "Word copy")
+                    .on_hover_text(format!(
+                        "Rebuild the printed worksheet, without the student's writing, as a Word document placed like the scan, and open it · {} · {model}",
+                        self.settings.provider
+                    ))
+                    .clicked()
+                {
+                    task = Some("Word");
+                }
             });
         });
         if let Err(e) = &self.ocr_status {
@@ -606,6 +615,7 @@ impl App {
                 }
             }
             Some("Grade") => self.grade(ctx),
+            Some("Word") => self.word_copy(ctx),
             Some(t) => self.ai(ctx, t),
             None => {}
         }
