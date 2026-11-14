@@ -10,6 +10,7 @@ pub mod cli;
 pub mod docx;
 pub mod extract;
 pub mod fit;
+pub mod orient;
 
 use serde::{Deserialize, Serialize};
 

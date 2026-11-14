@@ -6,7 +6,8 @@
 //! documentashion ws render  <doc.docx> <out.png>                      draw it with WordCraft
 //! documentashion ws compare <scan.png> <doc.docx> <out.png> [--shear S] scan and rebuild overlaid
 //! documentashion ws fit     <scan.png> <sheet.json> [--rounds N]      line the rebuild up with the scan
-//! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      extract, fit and build
+//! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
+//! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
 //! ```
 use super::*;
 use std::{
@@ -14,7 +15,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|rebuild …";
+const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|upright|rebuild …";
 
 pub fn main(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -55,17 +56,39 @@ pub fn main(args: &[String]) -> Result<(), String> {
             eprintln!("{r}");
             save(&sheet, path)
         }
+        "upright" => upright(Path::new(arg(1)?), Path::new(arg(2)?)).map(|_| ()),
         "rebuild" => {
-            let scan = Path::new(arg(1)?);
             let out = Path::new(arg(2)?);
-            let mut sheet = extract::extract(scan, &model)?;
-            save(&sheet, &out.with_extension("json"))?;
-            fit::fit(scan, &mut sheet, 4)?;
-            save(&sheet, &out.with_extension("json"))?;
-            build(&sheet, out)
+            rebuild(Path::new(arg(1)?), out, &model).map(|r| eprintln!("{}: {r}", out.display()))
         }
         _ => Err(USAGE.into()),
     }
+}
+
+/// Writes `scan` turned the right way up to `out`; returns the quarter turns it took.
+pub fn upright(scan: &Path, out: &Path) -> Result<u8, String> {
+    let img = image::open(scan).map_err(|e| format!("{}: {e}", scan.display()))?;
+    let turns = orient::upright(&img);
+    orient::turn(img, turns).save(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    Ok(turns)
+}
+
+/// The whole rebuild of one scanned page: turned upright (kept beside `out` as
+/// `<name>.scan.png`), read, fitted to the scan and written as `out`; the worksheet itself is
+/// kept as `<name>.json`. Returns how well it fits.
+pub fn rebuild(scan: &Path, out: &Path, model: &str) -> Result<fit::Report, String> {
+    let page = out.with_extension("scan.png");
+    let turns = upright(scan, &page)?;
+    if turns != 0 {
+        eprintln!("turned the page {} degrees", turns as u32 * 90);
+    }
+    let mut sheet = extract::extract(&page, model)?;
+    let json = out.with_extension("json");
+    save(&sheet, &json)?;
+    let report = fit::fit(&page, &mut sheet, 10)?;
+    save(&sheet, &json)?;
+    build(&sheet, out)?;
+    Ok(report)
 }
 
 pub fn load(path: &Path) -> Result<Sheet, String> {
@@ -108,10 +131,22 @@ pub fn render(doc: &Path, png: &Path, page: usize) -> Result<PathBuf, String> {
     Ok(png.to_path_buf())
 }
 
-/// The program that draws verSHion figures: `DOCUMENTASHION_VERSHION_FIGURE`, or
-/// `vershion-figure` on PATH. It reads `{"id":…, "params":{…}}` on stdin and prints the SVG.
+/// The program that draws verSHion figures (`tools/vershion-figure`, which `install.sh` puts
+/// beside the app): `DOCUMENTASHION_VERSHION_FIGURE`, else one next to this program, else in this
+/// checkout's `tools` build, else `vershion-figure` on PATH. It reads `{"id":…, "params":{…}}` on
+/// stdin and prints the SVG.
 pub fn vershion_figure() -> PathBuf {
-    std::env::var_os("DOCUMENTASHION_VERSHION_FIGURE").map(PathBuf::from).unwrap_or_else(|| "vershion-figure".into())
+    if let Some(p) = std::env::var_os("DOCUMENTASHION_VERSHION_FIGURE") {
+        return p.into();
+    }
+    let exe = std::env::current_exe().ok();
+    let beside = exe.as_ref().and_then(|e| e.parent()).map(|d| d.join("vershion-figure"));
+    // target/{debug,release}/documentashion → tools/vershion-figure/target/release/…
+    let checkout = exe
+        .as_ref()
+        .and_then(|e| e.ancestors().nth(3))
+        .map(|root| root.join("tools/vershion-figure/target/release/vershion-figure"));
+    beside.into_iter().chain(checkout).find(|p| p.is_file()).unwrap_or_else(|| "vershion-figure".into())
 }
 
 /// A figure as PNG bytes at 300 dpi of its size on the page.

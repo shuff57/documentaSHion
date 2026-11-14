@@ -21,6 +21,14 @@ Terminal=false
 Categories=Graphics;Scanning;
 StartupNotify=true
 DESKTOP
+# verSHion's figure generators, which draw the graphs of rebuilt worksheets. Optional: without
+# it a rebuild leaves graphs out.
+figure="tools/vershion-figure/target/release/vershion-figure"
+if [[ -f "$figure" ]]; then
+  install -m 755 "$figure" "$HOME/.local/bin/vershion-figure"
+else
+  printf 'Graphs in rebuilt worksheets need: (cd tools/vershion-figure && cargo build --release), then ./install.sh again.\n'
+fi
 if command -v update-desktop-database >/dev/null; then
   update-desktop-database "$HOME/.local/share/applications"
 fi

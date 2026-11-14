@@ -129,7 +129,7 @@ impl Reading {
         }
     }
 }
-fn tesseract() -> std::ffi::OsString {
+pub(crate) fn tesseract() -> std::ffi::OsString {
     std::env::var_os("DOCUMENTASHION_TESSERACT").unwrap_or_else(|| "tesseract".into())
 }
 /// Whether local OCR can run, for Settings.
