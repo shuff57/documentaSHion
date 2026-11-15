@@ -979,7 +979,7 @@ mod tests {
         eprintln!("anchored: {}", r.anchored);
         eprintln!("{} blocks in {:.0?}", r.blocks.len(), t.elapsed());
         std::fs::write(format!("{img}.rebuild.json"), serde_json::to_vec_pretty(&r).unwrap()).unwrap();
-        let project = Project { id: "live".into(), name: "Live rebuild".into(), pages: vec![page], key: vec![] };
+        let project = Project { id: "live".into(), name: "Live rebuild".into(), pages: vec![page], key: vec![], blank: None };
         std::fs::write(format!("{img}.project.json"), serde_json::to_vec(&project).unwrap()).unwrap();
     }
     #[test]

@@ -339,6 +339,9 @@ impl App {
         let key = p.render_key();
         let copy = self.pending.clone().or_else(|| p.rebuild_current().cloned());
         let has_copy = copy.is_some();
+        let read = copy.clone();
+        let marked = copy.clone().filter(|r| r.grade.is_some());
+        let mark_hover = self.mark_hover;
         let copy = copy.filter(|_| self.side_by_side);
         if self.texture.as_ref().is_none_or(|(k, _)| k != &key) {
             match p.render_within(Some(2200)) {
@@ -366,6 +369,26 @@ impl App {
                     let scan = Rect::from_min_size(both.min, size);
                     ui.painter().add(paper_shadow(scan, 10));
                     ui.painter().image(tex.id(), scan, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    // Each marked answer outlined on the scan in its verdict's colour; the one the
+                    // pointer is on in the marks list stands out.
+                    if let Some((r, g)) = marked.as_ref().and_then(|r| r.grade.as_ref().map(|g| (r, g))) {
+                        for (i, m) in g.marks.iter().enumerate() {
+                            let Some(area) = m.blocks.iter().filter_map(|&b| r.blocks.get(b)).map(|b| crate::pagecopy::block_rect(b, scan)).reduce(|a, b| a.union(b)) else { continue };
+                            let hot = mark_hover == Some(i);
+                            let pen = if m.unsure() { theme::amber() } else { crate::pagecopy::pen(m.verdict) };
+                            let area = area.expand(4.0);
+                            if hot {
+                                ui.painter().rect_filled(area, CornerRadius::same(4), pen.gamma_multiply(0.12));
+                            }
+                            ui.painter().rect_stroke(area, CornerRadius::same(4), Stroke::new(if hot { 2.5 } else { 1.2 }, pen.gamma_multiply(if hot { 1.0 } else { 0.7 })), StrokeKind::Outside);
+                        }
+                    }
+                    // Writing the reading flagged (unread, or read where there was no ink).
+                    if let Some(r) = read.as_ref().filter(|r| r.model == "Datalab") {
+                        for b in r.blocks.iter().filter(|b| b.handwritten && b.conf < Rebuild::UNSURE) {
+                            ui.painter().rect_stroke(crate::pagecopy::block_rect(b, scan).expand(3.0), CornerRadius::same(3), Stroke::new(1.5, theme::amber()), StrokeKind::Outside);
+                        }
+                    }
                     if let Some(r) = &copy {
                         let sheet = Rect::from_min_size(Pos2::new(scan.right() + gap, scan.top()), size);
                         ui.painter().add(paper_shadow(sheet, 10));
@@ -585,8 +608,13 @@ impl App {
                     task = Some("Correct");
                 }
                 let model = if self.settings.model.is_empty() { "no model set" } else { &self.settings.model };
+                let how = if self.project.blank.is_some() && self.datalab().is_some() {
+                    format!("Read the student's writing against the blank copy with Datalab, then mark it · {} · {model}", self.settings.provider)
+                } else {
+                    format!("Rebuild the page as a digital copy, the student's writing typed out · {} · {model}", self.settings.provider)
+                };
                 if kit::secondary(ui, Some(icon::EXAM), "AI grade")
-                    .on_hover_text(format!("Rebuild the page as a digital copy, the student's writing typed out · {} · {model}", self.settings.provider))
+                    .on_hover_text(how)
                     .clicked()
                 {
                     task = Some("Grade");

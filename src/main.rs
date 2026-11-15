@@ -1,4 +1,5 @@
 mod app;
+mod blank;
 mod claude;
 mod diff;
 mod imaging;

@@ -43,6 +43,8 @@ pub(crate) enum Event {
     Marks(String, Result<Grade, String>),
     /// An answer key read from a page or file, for review.
     AnswerKey(Result<Vec<KeyItem>, String>),
+    /// Pages of a blank copy of the worksheet, read, to add to the document's blank.
+    Blank(Result<Vec<crate::blank::BlankPage>, String>),
     /// The page rebuilt as a Word document: where it was saved, how well it fits the scan, and
     /// the student's work typed out beside the scan when that was made.
     Worksheet(Result<(std::path::PathBuf, String, Option<std::path::PathBuf>), String>),
@@ -119,6 +121,10 @@ pub(crate) struct App {
     pub(crate) scroll_to: Option<Vec2>,
     /// The answer key being typed or reviewed, as text, before it is saved.
     pub(crate) key_draft: Option<String>,
+    /// The mark the pointer is on in the marks list, outlined on the scan.
+    pub(crate) mark_hover: Option<usize>,
+    /// Show only the marks that need a look: wrong, partial, or unsure.
+    pub(crate) marks_look: bool,
 }
 impl App {
     /// `secrets`: look up a saved API key at start (off for headless previews).
@@ -160,6 +166,8 @@ impl App {
             side_by_side: true,
             scroll_to: None,
             key_draft: None,
+            mark_hover: None,
+            marks_look: false,
         };
         if secrets {
             app.load_key(ctx);
@@ -263,8 +271,89 @@ impl App {
             });
         }
     }
-    /// Rebuilds the selected page as a digital copy and marks it, in the background.
+    /// The Datalab key: typed or saved in Settings, else `DATALAB_API_KEY`.
+    pub(crate) fn datalab(&self) -> Option<String> {
+        Some(self.datalab_key.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("DATALAB_API_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()))
+    }
+    /// Reads pages of a blank copy of the worksheet in the background, each image first copied
+    /// into the document so the blank stays when the original moves.
+    pub(crate) fn read_blank(&mut self, ctx: &egui::Context, pages: Vec<Page>, files: Vec<std::path::PathBuf>) {
+        let Some(key) = self.datalab() else {
+            self.status = "Add a Datalab key in Settings → AI provider to read a blank copy.".into();
+            return;
+        };
+        let dir = self.project.dir();
+        let (dpi, cleanup) = (self.settings.dpi, self.settings.auto_cleanup);
+        self.launch(ctx, move |c| {
+            let mut pages = pages;
+            // Files become pages as scans do: a PDF drawn at 300 dpi, an image tidied like a scan.
+            for f in files {
+                let (images, dpi) = if f.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+                    match services::import_pdf(&f, &c) {
+                        Ok(images) => (images, 300),
+                        Err(e) => return Event::Blank(Err(e)),
+                    }
+                } else {
+                    (vec![f], dpi)
+                };
+                for image in images {
+                    let a = if cleanup { image::open(&image).ok().map(|i| crate::imaging::analyze(&i)) } else { None };
+                    let a2 = a.unwrap_or_default();
+                    pages.push(Page { id: id(), image, dpi, clean: a.is_some(), skew: a2.skew, straighten: a.is_some() && a2.skew != 0.0, crop: a2.crop, ..Default::default() });
+                }
+            }
+            let mut out = vec![];
+            for mut p in pages {
+                if c.load(Ordering::Relaxed) {
+                    return Event::Blank(Err("Cancelled".into()));
+                }
+                let ext = p.image.extension().and_then(|e| e.to_str()).unwrap_or("png").to_string();
+                let dest = dir.join(format!("blank-{}.{ext}", id()));
+                if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&p.image, &dest)) {
+                    return Event::Blank(Err(format!("Couldn't keep the blank copy: {e}")));
+                }
+                p.image = dest;
+                p.history.clear();
+                p.rebuild = None;
+                match crate::blank::read_blank(p, &key) {
+                    Ok(b) => out.push(b),
+                    Err(e) => return Event::Blank(Err(e)),
+                }
+            }
+            Event::Blank(Ok(out))
+        });
+    }
+    /// Rebuilds the selected page as a digital copy and marks it, in the background. With a blank
+    /// copy and a Datalab key, the student's writing is read against the blank, the name blanked
+    /// before the page is sent.
     fn grade(&mut self, ctx: &egui::Context) {
+        if let (Some(p), Some(blank), Some(dkey)) = (self.project.pages.get(self.selected).cloned(), self.project.blank.clone(), self.datalab()) {
+            let (s, api, key) = (self.settings.clone(), self.key.clone(), self.project.key.clone());
+            self.launch(ctx, move |c| {
+                let r = crate::blank::read_page(&p, &blank, &dkey).map(|read| {
+                    let mut r = read.rebuild;
+                    if c.load(Ordering::Relaxed) {
+                        return (r, None);
+                    }
+                    let mut png = std::io::Cursor::new(vec![]);
+                    let img = image::DynamicImage::ImageLuma8(read.sent).write_to(&mut png, image::ImageFormat::Png).map(|_| {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+                    });
+                    match img.map_err(|e| e.to_string()).and_then(|img| crate::marking::mark_image(&img, &r, &key, &s, &api)) {
+                        Ok(g) => {
+                            r.grade = Some(g);
+                            (r, None)
+                        }
+                        Err(e) => (r, Some(format!("Not marked: {e}"))),
+                    }
+                });
+                Event::Rebuild(p.id.clone(), r)
+            });
+            return;
+        }
         if let Some(p) = self.project.pages.get(self.selected).cloned() {
             let (s, api, key) = (self.settings.clone(), self.key.clone(), self.project.key.clone());
             self.launch(ctx, move |c| {
@@ -290,9 +379,7 @@ impl App {
         let Some(n) = (!self.project.pages.is_empty()).then_some(self.selected) else { return };
         let p = self.project.pages[n].clone();
         let (s, key) = (self.settings.clone(), self.key.clone());
-        let work_key = Some(self.datalab_key.trim().to_string())
-            .filter(|k| !k.is_empty())
-            .or_else(|| std::env::var("DATALAB_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+        let work_key = self.datalab();
         let dir = self.project.dir();
         let name: String = self.project.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
         let out = dir.join(format!("{} - page {}.docx", name.trim(), n + 1));
@@ -420,7 +507,20 @@ impl App {
                 self.status = format!("Answer key read · {} questions · check it, then save", items.len());
                 self.key_draft = Some(crate::marking::format_key(&items));
             }
-            Event::Rebuild(_, Err(e)) | Event::Marks(_, Err(e)) | Event::AnswerKey(Err(e)) => self.status = e,
+            Event::Blank(Ok(pages)) => {
+                let lines: usize = pages.iter().map(|p| p.lines.len()).sum();
+                let names = pages.iter().any(|p| !p.names.is_empty());
+                let blank = self.project.blank.get_or_insert_with(Default::default);
+                blank.pages.extend(pages);
+                let n = blank.pages.len();
+                self.status = format!(
+                    "Blank copy read · {n} page{} · {lines} printed lines{}",
+                    if n == 1 { "" } else { "s" },
+                    if names || blank.pages.iter().any(|p| !p.names.is_empty()) { "" } else { " · no Name line found, so pages won't be sent" }
+                );
+                self.save();
+            }
+            Event::Rebuild(_, Err(e)) | Event::Marks(_, Err(e)) | Event::AnswerKey(Err(e)) | Event::Blank(Err(e)) => self.status = e,
             Event::Update(r) => {
                 self.status = match &r {
                     Ok(s) if s.behind => "An update is available.".into(),

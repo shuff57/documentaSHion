@@ -169,6 +169,7 @@ mod tests {
             id: "test".into(),
             name: "Test".into(),
             key: vec![],
+            blank: None,
             pages: vec![Page {
                 image: path,
                 text: "Algebra worksheet (2026) — café".into(),
@@ -218,6 +219,7 @@ mod tests {
             id: "test".into(),
             name: "Test".into(),
             key: vec![],
+            blank: None,
             pages: vec![page],
         };
         let pdf = dir.join("test.pdf");

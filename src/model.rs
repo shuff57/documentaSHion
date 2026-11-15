@@ -352,6 +352,9 @@ pub struct Project {
     /// The answer key AI grade marks against; empty means the model solves the questions.
     #[serde(default)]
     pub key: Vec<KeyItem>,
+    /// A blank copy of the worksheet, read: the student's writing is read against it.
+    #[serde(default)]
+    pub blank: Option<crate::blank::Blank>,
 }
 impl Project {
     pub fn new() -> Self {
@@ -360,6 +363,7 @@ impl Project {
             name: "Untitled scan".into(),
             pages: vec![],
             key: vec![],
+            blank: None,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -496,6 +500,7 @@ mod tests {
             id: "fixture".into(),
             name: "Algebra".into(),
             key: vec![],
+            blank: None,
             pages: vec![Page {
                 image: "original.png".into(),
                 text: "2 + 2".into(),

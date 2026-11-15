@@ -294,6 +294,49 @@ fn flow(painter: &Painter, cache: &mut Cache, b: &Block, px: f32, width: f32) ->
     (items, (y - line_gap).max(0.0), widest)
 }
 
+/// Draws `text` (math in `$…$`) on a slip of paper the width of the space left in `ui`, as the
+/// copy sets it: the student's writing in its blue, else in print.
+pub fn slip(ui: &mut egui::Ui, cache: &mut Cache, text: &str, student: bool, px: f32) -> egui::Response {
+    let b = Block { text: text.to_owned(), handwritten: student, ..Default::default() };
+    let pad = Vec2::new(8.0, 5.0);
+    let width = (ui.available_width() - pad.x * 2.0).max(20.0);
+    let (items, height, _) = flow(ui.painter(), cache, &b, px, width);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width + pad.x * 2.0, height.max(px) + pad.y * 2.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(6), Color32::WHITE);
+    let ppp = ui.ctx().pixels_per_point();
+    let origin = rect.min + pad;
+    for it in items {
+        match it {
+            Item::Text { at, galley, strike } => {
+                let at = origin + at.to_vec2();
+                let size = galley.size();
+                painter.galley(at, galley, PRINTED);
+                if strike {
+                    let y = at.y + size.y * 0.55;
+                    painter.line_segment([Pos2::new(at.x, y), Pos2::new(at.x + size.x, y)], Stroke::new((px * 0.08).max(1.0), STUDENT));
+                }
+            }
+            Item::Math { at, size, latex, display } => {
+                if let Some(t) = cache.texture(ui.ctx(), &latex, px, display, student, ppp) {
+                    painter.image(t.id(), Rect::from_min_size(origin + at.to_vec2(), size), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                }
+            }
+        }
+    }
+    resp
+}
+
+/// The verdict's pen colour.
+pub fn pen(v: Verdict) -> Color32 {
+    match v {
+        Verdict::Right => RIGHT,
+        Verdict::Partial => PARTIAL,
+        Verdict::Wrong => WRONG,
+        Verdict::Blank => BLANK,
+    }
+}
+
 fn ascent(g: &Galley) -> f32 {
     g.rows
         .first()

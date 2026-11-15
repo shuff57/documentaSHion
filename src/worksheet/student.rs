@@ -333,7 +333,7 @@ pub fn convert(png: &[u8], key: &str) -> Result<Value, String> {
 
 /// The blocks of the first page of a Datalab JSON reply: type, box (pixels of an image `width`
 /// wide, as sent) and HTML.
-fn page_blocks(reply: &Value, width: f32) -> Result<Vec<(String, [f32; 4], String)>, String> {
+pub(crate) fn page_blocks(reply: &Value, width: f32) -> Result<Vec<(String, [f32; 4], String)>, String> {
     let json = match reply.get("json") {
         Some(Value::String(s)) => serde_json::from_str(s).map_err(|e| e.to_string())?,
         Some(v) => v.clone(),
@@ -383,7 +383,7 @@ fn name_boxes(words: &[fit::WordBox], right: f32) -> Vec<[f32; 4]> {
         .collect()
 }
 
-fn blank(page: &mut GrayImage, [x0, y0, x1, y1]: [f32; 4]) {
+pub(crate) fn blank(page: &mut GrayImage, [x0, y0, x1, y1]: [f32; 4]) {
     let (w, h) = page.dimensions();
     for y in (y0.max(0.0) as u32)..(y1.max(0.0) as u32).min(h) {
         for x in (x0.max(0.0) as u32)..(x1.max(0.0) as u32).min(w) {
@@ -396,13 +396,13 @@ fn blank(page: &mut GrayImage, [x0, y0, x1, y1]: [f32; 4]) {
 
 /// A line of Datalab's reading, or a table.
 #[derive(Clone, Debug, PartialEq)]
-enum Item {
+pub(crate) enum Item {
     Line(Vec<Run>),
     Table(Vec<Vec<Vec<Run>>>),
 }
 
 /// Datalab's HTML for one block as lines of runs (math as LaTeX) and tables.
-fn parse(html: &str) -> Vec<Item> {
+pub(crate) fn parse(html: &str) -> Vec<Item> {
     let mut items = vec![];
     let mut line: Vec<Run> = vec![];
     let mut style = Text::default();
@@ -644,7 +644,7 @@ impl Prints {
 
 /// A skeleton with the question label it starts with (`9.`, `(3)`, `b)`) taken off; `None`
 /// when it starts with none.
-fn unlabelled(s: &str) -> Option<&str> {
+pub(crate) fn unlabelled(s: &str) -> Option<&str> {
     let end = if let Some(rest) = s.strip_prefix('(') {
         let close = rest.find(')').filter(|&i| (1..=3).contains(&i))?;
         close + 2
@@ -660,7 +660,7 @@ fn unlabelled(s: &str) -> Option<&str> {
 /// Whether reading `s` is printed line `p` (both skeletons): nearly all of `s` is in `p`, and
 /// nearly all of `p` in `s`. A very short reading must match exactly, or any lone number would
 /// match some printed one.
-fn same(s: &str, p: &str) -> bool {
+pub(crate) fn same(s: &str, p: &str) -> bool {
     let (n, m) = (s.chars().count(), p.chars().count());
     if n < 4 {
         return s == p;
@@ -691,7 +691,7 @@ fn lcs(a: &[char], b: &[char]) -> usize {
 /// and digits (lower case) and the signs that carry meaning, with LaTeX commands, braces, spaces
 /// and superscripts left out. Superscripts go because a student's working is often written
 /// small above a printed equation (the number each term is multiplied by), and reads as a power.
-fn skeleton(s: &str) -> String {
+pub(crate) fn skeleton(s: &str) -> String {
     let mut out = String::new();
     let c: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -733,7 +733,7 @@ fn skeleton(s: &str) -> String {
     out
 }
 
-fn skeleton_runs(runs: &[Run]) -> String {
+pub(crate) fn skeleton_runs(runs: &[Run]) -> String {
     let mut s = String::new();
     for r in runs {
         match r {

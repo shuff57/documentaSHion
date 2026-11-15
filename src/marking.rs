@@ -184,7 +184,7 @@ fn text_of(v: &Value) -> String {
     }
 }
 
-const MARK_PROMPT: &str = r#"You are helping a teacher mark a student's work. The page is attached. It has already been read into these numbered parts (P: printed, S: the student's writing):
+const MARK_PROMPT: &str = r#"You are helping a teacher mark a student's work. The page is attached. It has already been read into these numbered parts (P: printed, S: the student's writing), each with where it starts on the page (x, y in thousandths of the page's width and height, from the top left):
 {PARTS}
 
 {KEY}
@@ -205,11 +205,18 @@ Rules:
 /// Asks the model to mark the student's answers on a rebuilt page, against `key` or, when it is
 /// empty, against its own solutions.
 pub fn mark(p: &Page, r: &Rebuild, key: &[KeyItem], s: &Settings, api: &str) -> Result<Grade, String> {
+    let (img, _, _) = page_png(p)?;
+    mark_image(&img, r, key, s, api)
+}
+
+/// Like [`mark`], with the page as sent (a PNG, base64): the copy read against a blank sends the
+/// page with the student's name blanked.
+pub fn mark_image(img: &str, r: &Rebuild, key: &[KeyItem], s: &Settings, api: &str) -> Result<Grade, String> {
     let parts = r
         .blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| format!("[{i}] {}: {}", if b.handwritten { "S" } else { "P" }, b.text.replace('\n', " / ")))
+        .map(|(i, b)| format!("[{i}] {} at ({:.0}, {:.0}): {}", if b.handwritten { "S" } else { "P" }, b.bbox[0], b.bbox[1], b.text.replace('\n', " / ")))
         .collect::<Vec<_>>()
         .join("\n");
     let key_text = if key.is_empty() {
@@ -224,8 +231,7 @@ pub fn mark(p: &Page, r: &Rebuild, key: &[KeyItem], s: &Settings, api: &str) -> 
         .replace("{PARTS}", &parts)
         .replace("{KEY}", &key_text)
         .replace("{EACH}", if key.is_empty() { " on the page" } else { " in the key, in the key's order" });
-    let (img, _, _) = page_png(p)?;
-    let reply = chat(s, api, &prompt, &img, true, Duration::from_secs(300))?;
+    let reply = chat(s, api, &prompt, img, true, Duration::from_secs(300))?;
     let mut g = parse_marks(&reply, key, r.blocks.len())?;
     g.model = s.model.clone();
     Ok(g)

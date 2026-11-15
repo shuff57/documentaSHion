@@ -12,6 +12,10 @@
 //! documentashion ws work    <scan.png> <sheet.json> <out.docx> [--shear S] [--dry-run]
 //!                                                 the student's work typed out beside the scan
 //!                                                 (needs DATALAB_API_KEY or a key saved in the app)
+//! documentashion ws read    <blank.png[,blank2.png]> <scan.png> <out.json> [--dpi N] [--dry-run]
+//!                           [--key key.txt]       the student's writing read against a blank copy
+//!                                                 (`--dry-run`: the page as it would be sent, as out.png;
+//!                                                 `--key`: marked against it by Claude too)
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
 //! documentashion ws page    <project id> <page n> [out.docx]            a project's page, as the app does it
 //! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
@@ -23,7 +27,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|review|graphs|work|upright|page|rebuild …";
+const USAGE: &str = "usage: documentashion ws extract|build|render|compare|fit|review|graphs|work|read|upright|page|rebuild …";
 
 pub fn main(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -82,6 +86,45 @@ pub fn main(args: &[String]) -> Result<(), String> {
             let n = student::work(Path::new(arg(1)?), &sheet, shear, &key, Path::new(arg(3)?))?;
             eprintln!("{n} pieces of the student's work");
             Ok(())
+        }
+        "read" => {
+            let dpi: u32 = flag("--dpi").and_then(|s| s.parse().ok()).unwrap_or(150);
+            let page = |image: &str| crate::model::Page { id: image.into(), image: PathBuf::from(image), dpi, ..Default::default() };
+            let key = student::key().ok_or("Set DATALAB_API_KEY, or save a Datalab key in the app's settings.")?;
+            let mut blank = crate::blank::Blank::default();
+            for b in arg(1)?.split(',') {
+                let bp = crate::blank::read_blank(page(b), &key)?;
+                eprintln!("blank {b}: {} printed lines, {} name line(s)", bp.lines.len(), bp.names.len());
+                blank.pages.push(bp);
+            }
+            let p = page(arg(2)?);
+            if args.iter().any(|a| a == "--dry-run") {
+                let (_, sent, i, fit) = crate::blank::outgoing(&p, &blank)?;
+                eprintln!("blank page {} · scale {:.3} · shift {:.0}, {:.0} · {:.0}% alike", i + 1, fit.s, fit.dx, fit.dy, fit.score * 100.0);
+                return sent.save(arg(3)?).map_err(|e| e.to_string());
+            }
+            let r = crate::blank::read_page(&p, &blank, &key)?;
+            let mut rebuild = r.rebuild;
+            eprintln!("blank page {} · scale {:.3} · shift {:.0}, {:.0} · {:.0}% alike", r.blank_page + 1, r.fit.s, r.fit.dx, r.fit.dy, r.fit.score * 100.0);
+            for b in rebuild.blocks.iter().filter(|b| b.handwritten) {
+                eprintln!("  [{:>3.0},{:>3.0}]{} {}", b.bbox[0], b.bbox[1], if b.conf < crate::model::Rebuild::UNSURE { " ?" } else { "  " }, b.text.replace('\n', " / "));
+            }
+            if let Some(k) = flag("--key") {
+                let items = crate::marking::parse_key(&std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?);
+                let s = crate::model::Settings { provider: "Claude".into(), model: model.clone(), ..Default::default() };
+                let mut png = std::io::Cursor::new(vec![]);
+                image::DynamicImage::ImageLuma8(r.sent).write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+                use base64::Engine;
+                let img = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+                let g = crate::marking::mark_image(&img, &rebuild, &items, &s, "")?;
+                let (got, max) = g.score();
+                eprintln!("marked {} / {}", crate::model::points(got), crate::model::points(max));
+                for m in &g.marks {
+                    eprintln!("  Q{:<4} {:?}{} {} (key {}) {}", m.question, m.verdict, if m.unsure() { " ?" } else { "" }, m.answer, m.expected, m.note);
+                }
+                rebuild.grade = Some(g);
+            }
+            std::fs::write(arg(3)?, serde_json::to_vec_pretty(&rebuild).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
         }
         "review" => {
             let path = Path::new(arg(2)?);

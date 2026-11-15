@@ -52,6 +52,8 @@ pub fn render(path: &str) {
     if let Ok(n) = std::env::var("DOCUMENTASHION_PREVIEW_SECTION") {
         app.settings_section = n.parse().unwrap_or(0);
     }
+    // A taller window shows more of a long inspector.
+    let height: u32 = std::env::var("DOCUMENTASHION_PREVIEW_HEIGHT").ok().and_then(|h| h.parse().ok()).unwrap_or(920);
     let mut textures = std::collections::HashMap::new();
     let mut last = None;
     let scroll = app.scroll_to;
@@ -63,7 +65,7 @@ pub fn render(path: &str) {
                 time: Some(1.0 + pass as f64 * 0.3),
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1440., 920.),
+                    egui::vec2(1440., height as f32),
                 )),
                 ..Default::default()
             },
@@ -91,7 +93,7 @@ pub fn render(path: &str) {
         last = Some(out);
     }
     let out = last.unwrap();
-    let mut canvas = image::RgbaImage::from_pixel(1440, 920, image::Rgba([247, 244, 235, 255]));
+    let mut canvas = image::RgbaImage::from_pixel(1440, height, image::Rgba([247, 244, 235, 255]));
     for clipped in ctx.tessellate(out.shapes, 1.0) {
         let Primitive::Mesh(mesh) = clipped.primitive else {
             continue;
@@ -135,7 +137,7 @@ pub fn render(path: &str) {
                 .max(b.pos.y)
                 .max(c.pos.y)
                 .min(clipped.clip_rect.max.y)
-                .min(919.) as u32;
+                .min(height as f32 - 1.) as u32;
             for y in miny..=maxy {
                 for x in minx..=maxx {
                     let p = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);

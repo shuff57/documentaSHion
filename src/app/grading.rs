@@ -5,7 +5,7 @@ use crate::{
     marking,
     ui::kit::{Tier, ty},
 };
-use egui::{Align, Layout, Margin, RichText, Sense};
+use egui::{Align, Layout, Margin, Rect, RichText, Sense};
 
 /// What a mark row changed this frame.
 #[derive(Default)]
@@ -19,9 +19,73 @@ struct Edit {
 
 impl App {
     pub(super) fn grading(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
+        self.blank_copy(ui, ctx, busy);
         self.answer_key(ui, ctx, busy);
         self.copy_review(ui);
         self.marks(ui, ctx, busy);
+    }
+
+    /// The blank copy of the worksheet the student's writing is read against.
+    fn blank_copy(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
+        kit::rule(ui);
+        ui.horizontal(|ui| {
+            kit::label(ui, "Blank copy");
+            if let Some(b) = &self.project.blank {
+                let lines: usize = b.pages.iter().map(|p| p.lines.len()).sum();
+                kit::quiet_pill(ui, &format!("{} page{} · {lines} printed lines", b.pages.len(), if b.pages.len() == 1 { "" } else { "s" }));
+            }
+        });
+        let has_key = self.datalab().is_some();
+        match &self.project.blank {
+            None => {
+                ui.label(kit::meta(
+                    "With a blank copy of the worksheet, AI grade reads the student's writing with Datalab: each page is lined up with the blank, the student's name blanked before it's sent, and only what the student added kept.",
+                ));
+            }
+            Some(b) if b.pages.iter().all(|p| p.names.is_empty()) => {
+                kit::note(ui, icon::WARNING, "No Name line was found on the blank, so there's no telling where names are written: pages won't be sent. Add the page with the Name line.", theme::amber());
+            }
+            Some(_) => {
+                ui.label(kit::meta("AI grade reads each page against this blank with Datalab. The Name line is blanked before a page is sent. Add the other side if the worksheet has two."));
+            }
+        }
+        if !has_key {
+            kit::note(ui, icon::INFO, "Needs a Datalab key: Settings → AI provider → Student work.", theme::accent());
+        }
+        let mut read = None;
+        let mut import = false;
+        let mut remove = false;
+        ui.add_enabled_ui(!busy && has_key, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let more = self.project.blank.is_some();
+                kit::menu_button(ui, Tier::Secondary, Some(icon::SCAN), if more { "Add a page" } else { "From a page" }, |ui| {
+                    for i in 0..self.project.pages.len() {
+                        if kit::menu_item(ui, icon::FILE_TEXT, &format!("Page {}", i + 1)).clicked() {
+                            read = Some(i);
+                        }
+                    }
+                })
+                .on_hover_text("Use a scanned page of this document as the blank");
+                if kit::tertiary(ui, Some(icon::UPLOAD_SIMPLE), "Import…").on_hover_text("Read the blank from images or a PDF").clicked() {
+                    import = true;
+                }
+                if more && kit::tertiary(ui, Some(icon::X), "Remove").clicked() {
+                    remove = true;
+                }
+            });
+        });
+        if let Some(i) = read {
+            let p = self.project.pages[i].clone();
+            self.read_blank(ctx, vec![p], vec![]);
+        } else if import {
+            if let Some(paths) = rfd::FileDialog::new().add_filter("Blank pages", &["png", "jpg", "jpeg", "tif", "tiff", "pnm", "pdf"]).pick_files() {
+                self.read_blank(ctx, vec![], paths);
+            }
+        } else if remove {
+            self.project.blank = None;
+            self.status = "Blank copy removed · AI grade reads pages with the vision model".into();
+            self.save();
+        }
     }
 
     fn answer_key(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) {
@@ -132,7 +196,9 @@ impl App {
             if unsure > 0 {
                 kit::note(ui, icon::WARNING, "Shaded parts are ones the model was unsure of, or couldn't read. Point at a part to see it outlined on the scan.", theme::amber());
             }
-            if !r.anchored {
+            if r.model == "Datalab" {
+                kit::note(ui, icon::INFO, "Read by Datalab against the blank copy. Each mark below shows the student's writing from the scan beside how it was read.", theme::accent());
+            } else if !r.anchored {
                 kit::note(ui, icon::INFO, "Positions are the model's estimate. With Tesseract installed, AI grade lines the copy up with the printed text.", theme::accent());
             }
             ui.label(kit::meta(format!("Blue text is the student's writing · {}", r.model)));
@@ -209,10 +275,25 @@ impl App {
         if unsure > 0 {
             kit::note(ui, icon::WARNING, &format!("{unsure} flagged: the model was unsure of {}. Check against the scan.", if unsure == 1 { "this mark" } else { "these marks" }), theme::amber());
         }
+        let look = g.marks.iter().filter(|m| m.unsure() || matches!(m.verdict, Verdict::Wrong | Verdict::Partial)).count();
+        if look > 0 && look < g.marks.len() {
+            ui.checkbox(&mut self.marks_look, format!("Only the {look} that need a look"));
+        }
+        let only = self.marks_look && look > 0;
         let mut edit = Edit::default();
+        let blocks = copy.blocks.clone();
+        let tex = self.texture.as_ref().map(|t| t.1.clone());
+        let cache = &mut self.copy_cache;
+        let mut hover = None;
         ui.add_enabled_ui(!busy, |ui| {
             for (i, m) in g.marks.iter_mut().enumerate() {
-                let e = mark_row(ui, i, m, g.solved);
+                if only && !(m.unsure() || matches!(m.verdict, Verdict::Wrong | Verdict::Partial)) {
+                    continue;
+                }
+                let (e, hot) = mark_row(ui, i, m, g.solved, &blocks, tex.as_ref(), cache);
+                if hot {
+                    hover = Some(i);
+                }
                 edit.changed |= e.changed;
                 edit.step |= e.step;
                 edit.dragging |= e.dragging;
@@ -222,8 +303,9 @@ impl App {
                 .on_hover_text("Mark this copy again with the current answer key")
                 .clicked();
         });
+        self.mark_hover = hover;
         if !g.model.is_empty() {
-            ui.label(kit::meta(format!("Suggested by {}. Click a mark to change it.", g.model)));
+            ui.label(kit::meta(format!("Suggested by {}. Click a mark to change it; point at one to see it on the scan.", g.model)));
         }
         if edit.changed {
             if pending {
@@ -250,10 +332,11 @@ impl App {
     }
 }
 
-/// One question's mark: verdict, points, the two answers and the model's note.
-fn mark_row(ui: &mut egui::Ui, i: usize, m: &mut Mark, solved: bool) -> Edit {
+/// One question's mark: verdict, points, the student's writing as scanned and as read, the
+/// expected answer and the model's note. Also whether the pointer is on it.
+fn mark_row(ui: &mut egui::Ui, i: usize, m: &mut Mark, solved: bool, blocks: &[Block], tex: Option<&egui::TextureHandle>, cache: &mut crate::pagecopy::Cache) -> (Edit, bool) {
     let mut e = Edit::default();
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(theme::field())
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::symmetric(12, 10))
@@ -298,13 +381,40 @@ fn mark_row(ui: &mut egui::Ui, i: usize, m: &mut Mark, solved: bool) -> Edit {
                     e.changed = true;
                     e.step = true;
                 }
-                let shown = |s: &str| if s.trim().is_empty() { "—".to_string() } else { s.to_string() };
-                ui.add(egui::Label::new(kit::meta(format!("Student: {}", shown(&m.answer)))).wrap());
-                ui.add(egui::Label::new(kit::meta(format!("{}: {}", if solved { "AI's answer" } else { "Key" }, shown(&m.expected)))).wrap());
+                // The student's writing as scanned, to check the reading against.
+                let area = m.blocks.iter().filter_map(|&b| blocks.get(b)).map(|b| b.bbox).reduce(|a, b| {
+                    let (x0, y0) = (a[0].min(b[0]), a[1].min(b[1]));
+                    [x0, y0, (a[0] + a[2]).max(b[0] + b[2]) - x0, (a[1] + a[3]).max(b[1] + b[3]) - y0]
+                });
+                let typed = |ui: &mut egui::Ui, cache: &mut crate::pagecopy::Cache, label: &str, text: &str, student: bool| {
+                    ui.label(kit::meta(label));
+                    if text.trim().is_empty() {
+                        ui.label(kit::meta("—"));
+                    } else {
+                        crate::pagecopy::slip(ui, cache, text, student, 15.0);
+                    }
+                };
+                ui.horizontal_top(|ui| {
+                    if let (Some([x, y, w, h]), Some(tex)) = (area, tex) {
+                        let pad = 6.0;
+                        let uv = Rect::from_min_max(Pos2::new((x - pad).max(0.0) / 1000.0, (y - pad).max(0.0) / 1000.0), Pos2::new((x + w + pad).min(1000.0) / 1000.0, (y + h + pad).min(1000.0) / 1000.0));
+                        let px = tex.size_vec2() * uv.size();
+                        let k = (ui.available_width() * 0.45 / px.x.max(1.0)).min(110.0 / px.y.max(1.0)).min(1.5);
+                        let (r, resp) = ui.allocate_exact_size(px * k, Sense::hover());
+                        ui.painter().rect_filled(r.expand(1.0), CornerRadius::same(4), Color32::WHITE);
+                        ui.painter().image(tex.id(), r, uv, Color32::WHITE);
+                        resp.on_hover_text("The student's writing, from the scan");
+                    }
+                    ui.vertical(|ui| {
+                        typed(ui, cache, "Read as", &m.answer, true);
+                        typed(ui, cache, if solved { "AI's answer" } else { "Key" }, &m.expected, false);
+                    });
+                });
                 if !m.note.trim().is_empty() {
                     ui.add(egui::Label::new(kit::body(&m.note).size(ty::META)).wrap());
                 }
             });
         });
-    e
+    let hot = ui.rect_contains_pointer(frame.response.rect);
+    (e, hot)
 }
