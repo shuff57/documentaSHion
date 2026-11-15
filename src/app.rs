@@ -337,6 +337,11 @@ impl App {
                     if c.load(Ordering::Relaxed) {
                         return (r, None);
                     }
+                    // A second reading by the vision model, without the key, before marking.
+                    let second = crate::blank::second_read(&read.sent, &mut r, &s, &api).err().map(|e| format!("No second reading: {e}"));
+                    if c.load(Ordering::Relaxed) {
+                        return (r, second);
+                    }
                     let mut png = std::io::Cursor::new(vec![]);
                     let img = image::DynamicImage::ImageLuma8(read.sent).write_to(&mut png, image::ImageFormat::Png).map(|_| {
                         use base64::Engine;
@@ -345,9 +350,10 @@ impl App {
                     match img.map_err(|e| e.to_string()).and_then(|img| crate::marking::mark_image(&img, &r, &key, &s, &api)) {
                         Ok(g) => {
                             r.grade = Some(g);
-                            (r, None)
+                            crate::blank::flag_disputed(&mut r);
+                            (r, second)
                         }
-                        Err(e) => (r, Some(format!("Not marked: {e}"))),
+                        Err(e) => (r, Some(second.map_or_else(|| format!("Not marked: {e}"), |w| format!("{w} · Not marked: {e}")))),
                     }
                 });
                 Event::Rebuild(p.id.clone(), r)

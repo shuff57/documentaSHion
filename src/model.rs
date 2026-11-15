@@ -49,6 +49,10 @@ pub struct Block {
     /// How sure the model is of its reading, 0–1.
     #[serde(default = "sure")]
     pub conf: f32,
+    /// A second reading of the student's writing, when it differs from `text`: the two readers
+    /// disagree, and the teacher should look.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt: String,
 }
 fn sure() -> f32 {
     1.0

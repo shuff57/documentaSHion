@@ -406,6 +406,7 @@ fn parse_blocks(reply: &str, w: f32, h: f32) -> Result<Vec<Block>, String> {
             text: text.to_owned(),
             line: (item.get("line").and_then(num).unwrap_or(0.0) * sy).clamp(0.0, 200.0),
             conf: item.get("conf").and_then(num).unwrap_or(1.0).clamp(0.0, 1.0),
+            alt: String::new(),
         });
     }
     if out.is_empty() {

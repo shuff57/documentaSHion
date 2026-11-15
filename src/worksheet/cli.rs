@@ -13,7 +13,7 @@
 //!                                                 the student's work typed out beside the scan
 //!                                                 (needs DATALAB_API_KEY or a key saved in the app)
 //! documentashion ws read    <blank.png[,blank2.png]> <scan.png> <out.json> [--dpi N] [--dry-run]
-//!                           [--key key.txt]       the student's writing read against a blank copy
+//!                           [--key key.txt] [--check]  the student's writing read against a blank copy
 //!                                                 (`--dry-run`: the page as it would be sent, as out.png;
 //!                                                 `--key`: marked against it by Claude too)
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
@@ -37,7 +37,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
         for a in args {
             if skip {
                 skip = false;
-            } else if a == "--dry-run" {
+            } else if a == "--dry-run" || a == "--check" {
                 // A switch: it takes no value.
             } else if a.starts_with("--") {
                 skip = true;
@@ -105,13 +105,19 @@ pub fn main(args: &[String]) -> Result<(), String> {
             }
             let r = crate::blank::read_page(&p, &blank, &key)?;
             let mut rebuild = r.rebuild;
+            let s = crate::model::Settings { provider: "Claude".into(), model: model.clone(), ..Default::default() };
+            // `--check`: a second reading by Claude, without the key.
+            if args.iter().any(|a| a == "--check") {
+                let (n, differ) = crate::blank::second_read(&r.sent, &mut rebuild, &s, "")?;
+                eprintln!("second reading ({model}): {n} pieces, {differ} read differently");
+            }
             eprintln!("blank page {} · scale {:.3} · shift {:.0}, {:.0} · {:.0}% alike", r.blank_page + 1, r.fit.s, r.fit.dx, r.fit.dy, r.fit.score * 100.0);
             for b in rebuild.blocks.iter().filter(|b| b.handwritten) {
-                eprintln!("  [{:>3.0},{:>3.0}]{} {}", b.bbox[0], b.bbox[1], if b.conf < crate::model::Rebuild::UNSURE { " ?" } else { "  " }, b.text.replace('\n', " / "));
+                let second = if b.alt.is_empty() { String::new() } else { format!("   ≠ {}", b.alt.replace('\n', " / ")) };
+                eprintln!("  [{:>3.0},{:>3.0}]{} {}{second}", b.bbox[0], b.bbox[1], if b.conf < crate::model::Rebuild::UNSURE { " ?" } else { "  " }, b.text.replace('\n', " / "));
             }
             if let Some(k) = flag("--key") {
                 let items = crate::marking::parse_key(&std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?);
-                let s = crate::model::Settings { provider: "Claude".into(), model: model.clone(), ..Default::default() };
                 let mut png = std::io::Cursor::new(vec![]);
                 image::DynamicImage::ImageLuma8(r.sent).write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
                 use base64::Engine;
@@ -123,6 +129,11 @@ pub fn main(args: &[String]) -> Result<(), String> {
                     eprintln!("  Q{:<4} {:?}{} {} (key {}) {}", m.question, m.verdict, if m.unsure() { " ?" } else { "" }, m.answer, m.expected, m.note);
                 }
                 rebuild.grade = Some(g);
+                crate::blank::flag_disputed(&mut rebuild);
+                if let Some(g) = &rebuild.grade {
+                    let flagged: Vec<&str> = g.marks.iter().filter(|m| m.unsure()).map(|m| m.question.as_str()).collect();
+                    eprintln!("flagged for a look: {}", if flagged.is_empty() { "none".to_string() } else { flagged.join(", ") });
+                }
             }
             std::fs::write(arg(3)?, serde_json::to_vec_pretty(&rebuild).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
         }

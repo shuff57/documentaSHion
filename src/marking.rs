@@ -200,7 +200,8 @@ Rules:
 - points: points earned, from 0 to max. Give partial points only when the working is substantially right but the answer is not.
 - conf: how sure you are of this mark, 0 to 1. Be honest: low when the writing is hard to read, the answer is ambiguous, or you are unsure of the correct answer.
 - note: one short sentence for the teacher on wrong and partial answers, e.g. what went wrong. Empty for right answers.
-- Read the student's writing from the image when the parts above look misread."#;
+- Read the student's writing from the image when the parts above look misread.
+- A part with "a second reader read" means two readers disagreed about the handwriting. Decide from the image what is written, mark that, and keep conf at 0.5 or below."#;
 
 /// Asks the model to mark the student's answers on a rebuilt page, against `key` or, when it is
 /// empty, against its own solutions.
@@ -216,7 +217,10 @@ pub fn mark_image(img: &str, r: &Rebuild, key: &[KeyItem], s: &Settings, api: &s
         .blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| format!("[{i}] {} at ({:.0}, {:.0}): {}", if b.handwritten { "S" } else { "P" }, b.bbox[0], b.bbox[1], b.text.replace('\n', " / ")))
+        .map(|(i, b)| {
+            let second = if b.alt.is_empty() { String::new() } else { format!(" [a second reader read: {}]", b.alt.replace('\n', " / ")) };
+            format!("[{i}] {} at ({:.0}, {:.0}): {}{second}", if b.handwritten { "S" } else { "P" }, b.bbox[0], b.bbox[1], b.text.replace('\n', " / "))
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let key_text = if key.is_empty() {

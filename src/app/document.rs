@@ -384,7 +384,7 @@ impl App {
                         }
                     }
                     // Writing the reading flagged (unread, or read where there was no ink).
-                    if let Some(r) = read.as_ref().filter(|r| r.model == "Datalab") {
+                    if let Some(r) = read.as_ref().filter(|r| r.model.starts_with("Datalab")) {
                         for b in r.blocks.iter().filter(|b| b.handwritten && b.conf < Rebuild::UNSURE) {
                             ui.painter().rect_stroke(crate::pagecopy::block_rect(b, scan).expand(3.0), CornerRadius::same(3), Stroke::new(1.5, theme::amber()), StrokeKind::Outside);
                         }

@@ -196,7 +196,7 @@ impl App {
             if unsure > 0 {
                 kit::note(ui, icon::WARNING, "Shaded parts are ones the model was unsure of, or couldn't read. Point at a part to see it outlined on the scan.", theme::amber());
             }
-            if r.model == "Datalab" {
+            if r.model.starts_with("Datalab") {
                 kit::note(ui, icon::INFO, "Read by Datalab against the blank copy. Each mark below shows the student's writing from the scan beside how it was read.", theme::accent());
             } else if !r.anchored {
                 kit::note(ui, icon::INFO, "Positions are the model's estimate. With Tesseract installed, AI grade lines the copy up with the printed text.", theme::accent());
@@ -273,7 +273,7 @@ impl App {
             kit::note(ui, icon::INFO, "No answer key: the model solved these questions itself. Check its answers before trusting the marks.", theme::accent());
         }
         if unsure > 0 {
-            kit::note(ui, icon::WARNING, &format!("{unsure} flagged: the model was unsure of {}. Check against the scan.", if unsure == 1 { "this mark" } else { "these marks" }), theme::amber());
+            kit::note(ui, icon::WARNING, &format!("{unsure} flagged: the handwriting or the mark is in doubt for {}. Check against the scan.", if unsure == 1 { "this one" } else { "these" }), theme::amber());
         }
         let look = g.marks.iter().filter(|m| m.unsure() || matches!(m.verdict, Verdict::Wrong | Verdict::Partial)).count();
         if look > 0 && look < g.marks.len() {
@@ -410,6 +410,19 @@ fn mark_row(ui: &mut egui::Ui, i: usize, m: &mut Mark, solved: bool, blocks: &[B
                         typed(ui, cache, if solved { "AI's answer" } else { "Key" }, &m.expected, false);
                     });
                 });
+                // The two readers disagreed about the writing: both readings, to judge by the scan.
+                let mut seen = vec![];
+                for b in m.blocks.iter().filter_map(|&i| blocks.get(i)).filter(|b| !b.alt.is_empty()) {
+                    // The pieces of one stack share its second reading.
+                    if seen.contains(&&b.alt) {
+                        continue;
+                    }
+                    seen.push(&b.alt);
+                    kit::note(ui, icon::WARNING, "The two readings of this writing differ. Check the scan.", theme::amber());
+                    let first: Vec<&str> = blocks.iter().filter(|o| o.alt == b.alt).map(|o| o.text.as_str()).collect();
+                    typed(ui, cache, "Datalab read", &first.join("\n"), true);
+                    typed(ui, cache, "Second reading", &b.alt, true);
+                }
                 if !m.note.trim().is_empty() {
                     ui.add(egui::Label::new(kit::body(&m.note).size(ty::META)).wrap());
                 }

@@ -741,7 +741,7 @@ fn assemble(p: &Page, bp: &BlankPage, fit: Fit, found: &[(String, [f32; 4], Stri
     let mut blocks: Vec<Block> = mapped
         .iter()
         .filter(|l| !l.figure && !l.text.is_empty())
-        .map(|l| Block { bbox: thou(l.bbox), handwritten: false, text: l.text.clone(), line: (l.bbox[3] - l.bbox[1]) / hf * 1000.0, conf: 1.0 })
+        .map(|l| Block { bbox: thou(l.bbox), handwritten: false, text: l.text.clone(), line: (l.bbox[3] - l.bbox[1]) / hf * 1000.0, conf: 1.0, alt: String::new() })
         .collect();
     let mut covered: Vec<[f32; 4]> = vec![];
     let work = |lines: &mut Vec<(String, [f32; 4])>, figure: bool, blocks: &mut Vec<Block>, covered: &mut Vec<[f32; 4]>| {
@@ -758,7 +758,7 @@ fn assemble(p: &Page, bp: &BlankPage, fit: Fit, found: &[(String, [f32; 4], Stri
         covered.push(area);
         covered.push(bbox);
         let line = if figure { 0.0 } else { (area[3] - area[1]) / rows / hf * 1000.0 };
-        blocks.push(Block { bbox: thou(bbox), handwritten: true, text, line, conf });
+        blocks.push(Block { bbox: thou(bbox), handwritten: true, text, line, conf, alt: String::new() });
     };
     for (kind, b, html) in found {
         let near: Vec<&PrintLine> = mapped
@@ -787,7 +787,7 @@ fn assemble(p: &Page, bp: &BlankPage, fit: Fit, found: &[(String, [f32; 4], Stri
             if !over {
                 // Drawn by the student, axes and all: the reading is too often made up.
                 if ink_in(ink, w, h, *b).0 >= 200 {
-                    blocks.push(Block { bbox: thou(*b), handwritten: true, text: "[unclear] The student's drawing: compare with the scan.".into(), line: 0.0, conf: 0.3 });
+                    blocks.push(Block { bbox: thou(*b), handwritten: true, text: "[unclear] The student's drawing: compare with the scan.".into(), line: 0.0, conf: 0.3, alt: String::new() });
                     covered.push(*b);
                 }
                 continue;
@@ -821,10 +821,234 @@ fn assemble(p: &Page, bp: &BlankPage, fit: Fit, found: &[(String, [f32; 4], Stri
     // term is multiplied by), read with the line.
     covered.extend(mapped.iter().filter(|l| !l.figure).map(|l| [l.bbox[0] - 4.0, l.bbox[1] - 6.0, l.bbox[2] + 4.0, l.bbox[3] + 6.0]));
     for b in unread(ink, w, h, &covered.iter().map(|b| [b[0] - 10.0, b[1] - 10.0, b[2] + 10.0, b[3] + 10.0]).collect::<Vec<_>>()) {
-        blocks.push(Block { bbox: thou(b), handwritten: true, text: "[unclear] Writing here wasn't read: compare with the scan.".into(), line: 0.0, conf: 0.0 });
+        blocks.push(Block { bbox: thou(b), handwritten: true, text: "[unclear] Writing here wasn't read: compare with the scan.".into(), line: 0.0, conf: 0.0, alt: String::new() });
     }
     blocks.sort_by(|a, b| (a.bbox[1] + a.bbox[3] / 2.0).total_cmp(&(b.bbox[1] + b.bbox[3] / 2.0)).then(a.bbox[0].total_cmp(&b.bbox[0])));
     Rebuild { blocks, geometry: p.geometry(), model: "Datalab".into(), anchored: true, grade: None }
+}
+
+// ---- A second reading ----
+
+/// Digits for numbering boxes on the page, three pixels wide and five high.
+const DIGITS: [[u8; 5]; 10] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111],
+    [0b010, 0b110, 0b010, 0b010, 0b111],
+    [0b111, 0b001, 0b111, 0b100, 0b111],
+    [0b111, 0b001, 0b111, 0b001, 0b111],
+    [0b101, 0b101, 0b111, 0b001, 0b001],
+    [0b111, 0b100, 0b111, 0b001, 0b111],
+    [0b111, 0b100, 0b111, 0b101, 0b111],
+    [0b111, 0b001, 0b010, 0b010, 0b010],
+    [0b111, 0b101, 0b111, 0b101, 0b111],
+    [0b111, 0b101, 0b111, 0b001, 0b111],
+];
+
+const TAG: image::Rgb<u8> = image::Rgb([210, 20, 20]);
+
+fn fill(img: &mut RgbImage, x0: i32, y0: i32, x1: i32, y1: i32, c: image::Rgb<u8>) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    for y in y0.max(0)..y1.min(h) {
+        for x in x0.max(0)..x1.min(w) {
+            img.put_pixel(x as u32, y as u32, c);
+        }
+    }
+}
+
+/// Outlines `b` (pixels) in red with a numbered red tag above its top-left corner.
+fn tag(img: &mut RgbImage, n: usize, [x0, y0, x1, y1]: [f32; 4]) {
+    let (x0, y0, x1, y1) = (x0 as i32 - 3, y0 as i32 - 3, x1 as i32 + 3, y1 as i32 + 3);
+    for t in 0..2 {
+        fill(img, x0 - t, y0 - t, x1 + t, y0 - t + 1, TAG);
+        fill(img, x0 - t, y1 + t - 1, x1 + t, y1 + t, TAG);
+        fill(img, x0 - t, y0 - t, x0 - t + 1, y1 + t, TAG);
+        fill(img, x1 + t - 1, y0 - t, x1 + t, y1 + t, TAG);
+    }
+    let k = 3;
+    let digits: Vec<usize> = n.to_string().bytes().map(|b| (b - b'0') as usize).collect();
+    let (w, h) = (digits.len() as i32 * 4 * k + k, 7 * k);
+    let (tx, ty) = (x0 - 1, if y0 - h - 1 >= 0 { y0 - h - 1 } else { y0 + 2 });
+    fill(img, tx, ty, tx + w, ty + h, TAG);
+    for (i, d) in digits.iter().enumerate() {
+        for (row, bits) in DIGITS[*d].iter().enumerate() {
+            for col in 0..3 {
+                if bits & (0b100 >> col) != 0 {
+                    let (px, py) = (tx + k + (i as i32 * 4 + col) * k, ty + k + row as i32 * k);
+                    fill(img, px, py, px + k, py + k, image::Rgb([255, 255, 255]));
+                }
+            }
+        }
+    }
+}
+
+/// What two readings have in common, for telling whether they agree: [`student::skeleton`]
+/// without the line breaks and fraction bars that readers write differently.
+fn agree(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.replace(" / ", "\n");
+    let (a, b) = (norm(a), norm(b));
+    // Writing read two ways ("0 or 1") is a doubt, never agreement.
+    if [&a, &b].iter().any(|s| s.contains(" or ")) && !(a.contains(" or ") && b.contains(" or ")) {
+        return false;
+    }
+    // A circled answer is read as one in brackets by one reader and bare by the other.
+    let sk = |s: &str| {
+        let k = student::skeleton(s).replace(['/', ','], "");
+        match k.strip_prefix('(').and_then(|k| k.strip_suffix(')')) {
+            Some(inner) if !inner.contains(['(', ')']) => inner.to_string(),
+            _ => k,
+        }
+    };
+    let last = |s: &str| s.lines().rev().map(sk).find(|l| !l.is_empty()).unwrap_or_default();
+    let (all_a, all_b, last_a, last_b) = (sk(&a), sk(&b), last(&a), last(&b));
+    // An answer: a lone number or word, or a letter equal to something. Working ("+15 +15",
+    // "10x/10 = 60/10") is split into lines differently by different readers.
+    let answer = |s: &str| {
+        let Some(l) = s.lines().rev().find(|l| !sk(l).is_empty()) else { return false };
+        let l = l.replace(['$'], " ").replace("\\quad", " ").replace("\\boxed", " ");
+        match l.split_once('=') {
+            Some((x, y)) => [x, y].iter().any(|side| {
+                let k = sk(side);
+                k.chars().count() == 1 && k.chars().all(char::is_alphabetic)
+            }),
+            None => l.split_whitespace().count() == 1,
+        }
+    };
+    // One reader often takes in more than the other (the printed problem, the numbers written
+    // over it): the shorter reading need only be found in the longer.
+    let (short, long): (Vec<char>, Vec<char>) = if all_a.chars().count() <= all_b.chars().count() { (all_a.chars().collect(), all_b.chars().collect()) } else { (all_b.chars().collect(), all_a.chars().collect()) };
+    // Nearly all of it in the same order, or (two readers taking lines in a different order) the
+    // same signs and digits all but a few.
+    let bag = || {
+        let mut rest = long.clone();
+        short.iter().filter(|c| rest.iter().position(|r| r == *c).map(|i| rest.swap_remove(i)).is_some()).count()
+    };
+    let within = if short.len() < 4 { short == long } else { student::lcs(&short, &long) as f32 >= 0.9 * short.len() as f32 || bag() as f32 >= 0.95 * short.len() as f32 };
+    // Where it ends in an answer, exactly the same answer; a fraction may be written in another
+    // order (-2/3 x and -2x/3), the same signs and digits.
+    let sorted = |s: &str| {
+        let mut c: Vec<char> = s.chars().collect();
+        c.sort();
+        c
+    };
+    let fraction = a.contains("\\frac") || b.contains("\\frac") || last_a.contains('/') || last_b.contains('/');
+    let ends = !(answer(&a) || answer(&b)) || last_a == last_b || (fraction && sorted(&last_a) == sorted(&last_b)) || all_a.contains(&last_b) || all_b.contains(&last_a);
+    within && ends
+}
+
+const SECOND_PROMPT: &str = r#"A student's worksheet page is attached. Pieces of the student's handwriting are outlined in red, each numbered on a red tag.
+
+For each box, write exactly what the student wrote inside it. Transcribe only: do not correct, complete or solve anything, even when it is wrong. Separate the lines of a box with " / ". Write mathematics as LaTeX in $...$. Write [unclear] for anything you cannot read. Where something could fairly be read two ways (a digit written over another, a mark that may be a 1 or a 0), give both, separated by " or "; don't choose.
+
+The printed line nearest each box, for context only:
+{CONTEXT}
+
+Return ONLY a JSON object, no commentary: {"boxes":[{"n":1,"text":"..."}]}"#;
+
+/// Reads the student's writing on `sent` (the page as sent, name blanked) a second time with
+/// the vision model in Settings, without the answer key, and compares it with Datalab's reading:
+/// where the two disagree, the second reading is kept beside the first and the piece is flagged.
+/// Returns how many pieces it read and how many readings disagreed.
+pub fn second_read(sent: &GrayImage, r: &mut Rebuild, s: &Settings, api: &str) -> Result<(usize, usize), String> {
+    let (w, h) = (sent.width() as f32, sent.height() as f32);
+    let px = |b: &Block| [b.bbox[0] / 1000.0 * w, b.bbox[1] / 1000.0 * h, (b.bbox[0] + b.bbox[2]) / 1000.0 * w, (b.bbox[1] + b.bbox[3]) / 1000.0 * h];
+    let pieces = stacks(&r.blocks);
+    if pieces.is_empty() {
+        return Ok((0, 0));
+    }
+    // Each stack as one box, its pieces' readings as one, top to bottom.
+    let joined: Vec<Block> = pieces
+        .iter()
+        .map(|g| {
+            let b = g.iter().map(|&i| r.blocks[i].bbox).reduce(|a, b| {
+                let (x0, y0) = (a[0].min(b[0]), a[1].min(b[1]));
+                [x0, y0, (a[0] + a[2]).max(b[0] + b[2]) - x0, (a[1] + a[3]).max(b[1] + b[3]) - y0]
+            });
+            Block { bbox: b.unwrap_or_default(), handwritten: true, text: g.iter().map(|&i| r.blocks[i].text.as_str()).collect::<Vec<_>>().join("\n"), ..Default::default() }
+        })
+        .collect();
+    let mut img = image::DynamicImage::ImageLuma8(sent.clone()).to_rgb8();
+    let mut context = vec![];
+    for (n, b) in joined.iter().enumerate() {
+        tag(&mut img, n + 1, px(b));
+        // The lowest printed line that starts above the box, in its column.
+        let near = r
+            .blocks
+            .iter()
+            .filter(|p| !p.handwritten && p.bbox[1] <= b.bbox[1] + 10.0 && p.bbox[0] < b.bbox[0] + b.bbox[2] && p.bbox[0] + p.bbox[2] > b.bbox[0] - 50.0)
+            .max_by(|a, c| a.bbox[1].total_cmp(&c.bbox[1]));
+        context.push(format!("{}: {}", n + 1, near.map(|p| p.text.replace('\n', " ")).unwrap_or_else(|| "(none)".into())));
+    }
+    let mut png = std::io::Cursor::new(vec![]);
+    image::DynamicImage::ImageRgb8(img).write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    if let Some(dir) = std::env::var_os("DOCUMENTASHION_READ_DEBUG") {
+        let _ = std::fs::write(std::path::PathBuf::from(dir).join("second.png"), base64::engine::general_purpose::STANDARD.decode(&b64).unwrap_or_default());
+    }
+    let prompt = SECOND_PROMPT.replace("{CONTEXT}", &context.join("\n"));
+    let reply = crate::services::chat(s, api, &prompt, &b64, true, std::time::Duration::from_secs(300))?;
+    let bad = || "The second reading wasn't a list of boxes.".to_string();
+    let (a, b) = (reply.find('{').ok_or_else(bad)?, reply.rfind('}').ok_or_else(bad)?);
+    let v: Value = serde_json::from_str(reply.get(a..=b).ok_or_else(bad)?).map_err(|_| bad())?;
+    let mut differ = 0;
+    for item in v.get("boxes").and_then(Value::as_array).ok_or_else(bad)? {
+        let n = item.get("n").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0) as usize;
+        let Some((g, j)) = n.checked_sub(1).and_then(|n| pieces.get(n).zip(joined.get(n))) else { continue };
+        let Some(text) = item.get("text").and_then(Value::as_str) else { continue };
+        // Couldn't read it at all: no second opinion, not a different one.
+        if text.trim() == "[unclear]" {
+            continue;
+        }
+        if !agree(&j.text, text) {
+            for &i in g {
+                r.blocks[i].alt = text.replace(" / ", "\n");
+                r.blocks[i].conf = r.blocks[i].conf.min(0.45);
+            }
+            differ += 1;
+        }
+    }
+    r.model = format!("Datalab + {}", s.model);
+    Ok((pieces.len(), differ))
+}
+
+/// The student's pieces of writing (not the flags) gathered into stacks: lines of working one
+/// under another in the same column read as one, top to bottom.
+fn stacks(blocks: &[Block]) -> Vec<Vec<usize>> {
+    // A graph's reading (set without a line height) is a description, nothing to compare.
+    let mut list: Vec<usize> = blocks.iter().enumerate().filter(|(_, b)| b.handwritten && b.line > 0.0 && !b.text.starts_with("[unclear]")).map(|(i, _)| i).collect();
+    list.sort_by(|&a, &b| blocks[a].bbox[1].total_cmp(&blocks[b].bbox[1]));
+    let mut out: Vec<Vec<usize>> = vec![];
+    for i in list {
+        let b = blocks[i].bbox;
+        let joins = |g: &Vec<usize>| {
+            let last = blocks[*g.last().unwrap()].bbox;
+            let overlap = (b[0] + b[2]).min(last[0] + last[2]) - b[0].max(last[0]);
+            let gap = b[1] - (last[1] + last[3]);
+            // A printed line between them is the next question.
+            let (x0, x1) = (b[0].min(last[0]), (b[0] + b[2]).max(last[0] + last[2]));
+            let printed_between = blocks.iter().any(|p| {
+                let cy = p.bbox[1] + p.bbox[3] / 2.0;
+                !p.handwritten && cy > last[1] + last[3] / 2.0 && cy < b[1] + b[3] / 2.0 && p.bbox[0] < x1 && p.bbox[0] + p.bbox[2] > x0
+            });
+            overlap > 0.3 * b[2].min(last[2]) && gap < (1.5 * b[3].min(last[3])).max(25.0) && !printed_between
+        };
+        match out.iter_mut().find(|g| joins(g)) {
+            Some(g) => g.push(i),
+            None => out.push(vec![i]),
+        }
+    }
+    out
+}
+
+/// Marks on a piece the two readers disagreed about are flagged, however sure the marker was.
+pub fn flag_disputed(r: &mut Rebuild) {
+    let disputed: Vec<bool> = r.blocks.iter().map(|b| !b.alt.is_empty()).collect();
+    if let Some(g) = &mut r.grade {
+        for m in &mut g.marks {
+            if m.blocks.iter().any(|&i| disputed.get(i).copied().unwrap_or(false)) {
+                m.conf = m.conf.min(0.5);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -916,6 +1140,37 @@ mod tests {
         assert_eq!(filled("When x increase by 1, y changes", "When x increases by 1, y changes"), None);
         assert_eq!(filled("When x increases by 1, y changes by the difference. Compare", "When x increases by 1, y changes by the ______. Compare").as_deref(), Some("difference"));
         assert_eq!(student::skeleton("y = \\underline{\\hspace{2cm}}"), "y=");
+    }
+
+    #[test]
+    fn two_readings_agree_on_the_writing_not_the_typing() {
+        assert!(agree("$\\frac{17x}{17} = \\frac{476}{17}$\n$x = 28$", "$17x/17 = 476/17$ / $x=28$"));
+        assert!(agree("$-3x$", "−3x"));
+        assert!(!agree("0", "1"));
+        assert!(!agree("pk9", "plug"));
+        assert!(!agree("0", "0 or 1"));
+        assert!(agree("6, 4, 2, 0, -2", "$6$ / $4$ / $2$ / $0$ / $-2$"));
+        // A long piece of working that differs only in its answer does not agree.
+        assert!(!agree("$5x - 7 = 18$\n$5x = 25$\n$x = 5$", "$5x - 7 = 18$ / $5x = 25$ / $x = 6$"));
+        // The printed problem and the numbers written over it, read by one reader only.
+        assert!(agree("$9x - 8x = 60$\n$x = 60$", "12 12 12 / $\\frac{x}{4} - \\frac{2x}{3} = 5$ / $9x - 8x = 60$ / $x = 60$"));
+        assert!(agree("$3y = 6 + (-2x)$\n$y = \\frac{-2}{3}x + 2$", "$3y = 6 + (-2x)$ / $y = \\frac{-2x}{3} + 2$"));
+    }
+
+    #[test]
+    fn working_down_a_column_is_one_stack() {
+        let b = |x: f32, y: f32, w: f32, h: f32| Block { bbox: [x, y, w, h], handwritten: true, text: "x".into(), line: h, ..Default::default() };
+        let blocks = [b(100.0, 100.0, 200.0, 20.0), b(110.0, 125.0, 150.0, 20.0), b(105.0, 150.0, 100.0, 20.0), b(600.0, 110.0, 150.0, 20.0), b(100.0, 400.0, 100.0, 20.0)];
+        assert_eq!(stacks(&blocks), vec![vec![0, 1, 2], vec![3], vec![4]]);
+        // The next question's printed line ends a stack.
+        let mut q = blocks[..3].to_vec();
+        q.push(Block { bbox: [90.0, 120.0, 300.0, 5.0], text: "(2) 3x = 6".into(), ..Default::default() });
+        assert_eq!(stacks(&q), vec![vec![0], vec![1, 2]]);
+        assert!(agree("(-17)", "$-17$"));
+        assert!(agree("$4 = -3(2) + b$ $10 = b$\n$4 = -6 + b$\n+6 +6", "$4=-3(2)+b$ / $4=-6+b$ / +6 +6 / $10=b$"));
+        // Working split into lines differently still agrees; a different answer doesn't.
+        assert!(agree("$4x + 6x - 15 = 45$\n$10x - 15 = 45$\n$+15 +15$\n$\\frac{10x}{10} = \\frac{60}{10}$", "$4x + 6x - 15 = 45$ / $10x - 15 = 45$ / $+15 \\quad +15$ / $10x = 60$ / $10 \\quad 10$"));
+        assert!(!agree("$30 + 12x = 9$\n$12x = -21$\n$x = \\frac{7}{4}$", "$30 + 12x = 9$ / $12x = -21$ / $x = \\frac{-7}{4}$"));
     }
 
     #[test]
