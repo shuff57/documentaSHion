@@ -866,7 +866,7 @@ fn tag(img: &mut RgbImage, n: usize, [x0, y0, x1, y1]: [f32; 4]) {
     let k = 3;
     let digits: Vec<usize> = n.to_string().bytes().map(|b| (b - b'0') as usize).collect();
     let (w, h) = (digits.len() as i32 * 4 * k + k, 7 * k);
-    let (tx, ty) = (x0 - 1, if y0 - h - 1 >= 0 { y0 - h - 1 } else { y0 + 2 });
+    let (tx, ty) = (x0 - 1, if y0 - h > 0 { y0 - h - 1 } else { y0 + 2 });
     fill(img, tx, ty, tx + w, ty + h, TAG);
     for (i, d) in digits.iter().enumerate() {
         for (row, bits) in DIGITS[*d].iter().enumerate() {
