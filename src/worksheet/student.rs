@@ -674,7 +674,7 @@ pub(crate) fn same(s: &str, p: &str) -> bool {
 }
 
 /// The length of the longest common subsequence.
-fn lcs(a: &[char], b: &[char]) -> usize {
+pub(crate) fn lcs(a: &[char], b: &[char]) -> usize {
     let mut row = vec![0usize; b.len() + 1];
     for &x in a {
         let mut prev = 0;
@@ -699,8 +699,29 @@ pub(crate) fn skeleton(s: &str) -> String {
         match c[i] {
             '\\' => {
                 i += 1;
+                let start = i;
                 while i < c.len() && c[i].is_ascii_alphabetic() {
                     i += 1;
+                }
+                // A blank drawn as space (`\underline{\hspace{2cm}}`) is nothing written: its
+                // size is not text.
+                let name: String = c[start..i].iter().collect();
+                if ["hspace", "vspace", "rule", "phantom", "hphantom", "vphantom"].contains(&name.as_str()) {
+                    while i < c.len() && c[i] == '{' {
+                        let mut depth = 0;
+                        while i < c.len() {
+                            if c[i] == '{' {
+                                depth += 1;
+                            } else if c[i] == '}' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        i += 1;
+                    }
                 }
                 continue;
             }

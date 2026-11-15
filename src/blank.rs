@@ -123,7 +123,7 @@ fn item_text(it: &Item) -> String {
         for r in rs {
             match r {
                 Run::Text(t) if t.strike => s.push_str(&format!("~~{}~~", t.text)),
-                Run::Text(t) if t.sup => s.push_str(&format!("^{}", t.text)),
+                Run::Text(t) if t.sup => s.push_str(&format!("^{{{}}}", t.text)),
                 Run::Text(t) => s.push_str(&t.text),
                 Run::Math { math, .. } => s.push_str(&format!("${math}$")),
                 Run::Br { .. } => s.push('\n'),
@@ -352,8 +352,11 @@ pub fn align(blank: &GrayImage, scan: &GrayImage) -> Fit {
 /// size of `scan`. Red ink is left out: it is the teacher's.
 fn student_ink(scan: &RgbImage, blank: &GrayImage, fit: Fit) -> Vec<bool> {
     let (bw, bh) = (blank.width() as usize, blank.height() as usize);
-    // The blank's print, widened a little for what lining up and scanning blur.
-    let mut print: Vec<bool> = blank.pixels().map(|p| p[0] < 170).collect();
+    // The blank's print, faint rules and grids too, widened a little for what lining up and
+    // scanning blur. Each page is judged against its own paper: a scan's is often grey.
+    let blank_paper = paper(blank);
+    let mut print: Vec<bool> = blank.pixels().map(|p| (p[0] as u16) + 14 < blank_paper as u16).collect();
+    let ink_below = paper(&grey(scan)).saturating_sub(45) as u32;
     dilate(&mut print, bw, bh, 3);
     let (w, h) = scan.dimensions();
     let mut out = vec![false; (w * h) as usize];
@@ -361,7 +364,7 @@ fn student_ink(scan: &RgbImage, blank: &GrayImage, fit: Fit) -> Vec<bool> {
         for x in 0..w {
             let [r, g, b] = scan.get_pixel(x, y).0;
             let lum = (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000;
-            if lum >= 185 || r as i32 - (g.max(b) as i32) > 60 {
+            if lum >= ink_below || r as i32 - (g.max(b) as i32) > 60 {
                 continue;
             }
             let bx = ((x as f32 - fit.dx) / fit.s).round();
@@ -371,6 +374,23 @@ fn student_ink(scan: &RgbImage, blank: &GrayImage, fit: Fit) -> Vec<bool> {
         }
     }
     out
+}
+
+/// The grey of the paper: the middle grey of the page, most of which is paper.
+fn paper(img: &GrayImage) -> u8 {
+    let mut h = [0usize; 256];
+    for p in img.pixels() {
+        h[p[0] as usize] += 1;
+    }
+    let half = (img.width() as usize * img.height() as usize) / 2;
+    let mut seen = 0;
+    for (v, n) in h.iter().enumerate() {
+        seen += n;
+        if seen > half {
+            return v as u8;
+        }
+    }
+    255
 }
 
 /// Grows every set cell of `m` by `r` in each direction.
@@ -479,7 +499,8 @@ fn unread(ink: &[bool], w: u32, h: u32, covered: &[[f32; 4]]) -> Vec<[f32; 4]> {
         // A scanner's streak or a fold's shadow is long and thin, and runs to the paper's edge.
         let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
         let streak = (bw <= 6 && bh >= 8 * bw) || (bh <= 6 && bw >= 8 * bh);
-        let edge = b[0] <= 1 || b[1] <= 1 || b[2] + 1 >= cw || b[3] + 1 >= ch;
+        // Within about a quarter inch of the edge: punched holes, the scanner's shadow.
+        let edge = b[0] <= 3 || b[1] <= 3 || b[2] + 3 >= cw || b[3] + 3 >= ch;
         if cells >= 5 && total >= 150 && !streak && !edge {
             out.push([(b[0] as u32 * C) as f32, (b[1] as u32 * C) as f32, (b[2] as u32 * C) as f32, (b[3] as u32 * C) as f32]);
         }
@@ -592,6 +613,122 @@ fn printed(sk: &str, near: &[&PrintLine]) -> bool {
     })
 }
 
+/// A word of a line, for comparing it with the print word by word.
+struct Tok {
+    text: String,
+    math: bool,
+    skel: String,
+    /// A printed blank to write in: a run of underscores, or space drawn as a line.
+    blank: bool,
+}
+
+/// A line's words; math is split at its spaces too, so a blank written in beside printed math
+/// is found.
+fn toks(s: &str) -> Vec<Tok> {
+    let mut out = vec![];
+    for (i, part) in s.split('$').enumerate() {
+        let math = i % 2 == 1;
+        for w in part.split_whitespace() {
+            let blank = w.contains("__") || w.contains("\\underline") || w.contains("\\hspace");
+            out.push(Tok { text: w.to_string(), math, skel: student::skeleton(w), blank });
+        }
+    }
+    out
+}
+
+/// What the student wrote into a printed line: the words of `read` that are in a printed blank,
+/// or added where the print has nothing, by comparing it with `print` word by word. Words read in
+/// place of printed ones are misreadings of the print and left out. `None` when nothing was added.
+fn filled(read: &str, print: &str) -> Option<String> {
+    let (a, b) = (toks(read), toks(print));
+    let eq = |x: &Tok, y: &Tok| !x.skel.is_empty() && !y.blank && x.skel == y.skel;
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if eq(&a[i], &b[j]) { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
+        }
+    }
+    // Walk the matching; between matched words, the reading's extra words and the print's.
+    let (mut i, mut j) = (0, 0);
+    let mut groups: Vec<Vec<&Tok>> = vec![];
+    let (mut ins, mut del): (Vec<&Tok>, Vec<&Tok>) = (vec![], vec![]);
+    fn close<'a>(ins: &mut Vec<&'a Tok>, del: &mut Vec<&'a Tok>, groups: &mut Vec<Vec<&'a Tok>>) {
+        let kept: Vec<&Tok> = ins.drain(..).filter(|t| !t.blank && !t.skel.is_empty()).collect();
+        if kept.iter().any(|t| t.skel.chars().any(char::is_alphanumeric)) && del.iter().all(|t| t.blank) {
+            groups.push(kept);
+        }
+        del.clear();
+    }
+    while i < n || j < m {
+        if i < n && j < m && eq(&a[i], &b[j]) {
+            close(&mut ins, &mut del, &mut groups);
+            i += 1;
+            j += 1;
+        } else if j < m && (i >= n || dp[i][j + 1] >= dp[i + 1][j]) {
+            del.push(&b[j]);
+            j += 1;
+        } else {
+            ins.push(&a[i]);
+            i += 1;
+        }
+    }
+    close(&mut ins, &mut del, &mut groups);
+    if groups.is_empty() {
+        return None;
+    }
+    let show = |g: &Vec<&Tok>| {
+        let mut s = String::new();
+        let mut in_math = false;
+        for t in g {
+            if t.math != in_math {
+                s.push_str(if in_math { "$ " } else { " $" });
+                in_math = t.math;
+            } else {
+                s.push(' ');
+            }
+            s.push_str(&t.text);
+        }
+        if in_math {
+            s.push('$');
+        }
+        s.trim().trim_end_matches(['.', ',', ';', ':']).trim().to_string()
+    };
+    Some(groups.iter().map(show).collect::<Vec<_>>().join(" · "))
+}
+
+/// The printed line (or two side by side) near a reading that it covers most of, and how much
+/// of the print it covers, 0–1.
+fn best_print(sk: &str, near: &[&PrintLine]) -> Option<(String, f32)> {
+    let a: Vec<char> = sk.chars().collect();
+    // The print that best accounts for the reading, all of it: not a shorter line it contains.
+    let mut best: Option<(String, f32, f32)> = None;
+    let mut consider = |text: String, skel: String| {
+        // Too short a print can't be told from a coincidence.
+        if skel.chars().count() < 8 {
+            return;
+        }
+        let b: Vec<char> = skel.chars().collect();
+        let common = student::lcs(&a, &b) as f32;
+        let (cover, fit) = (common / b.len() as f32, 2.0 * common / (a.len() + b.len()).max(1) as f32);
+        if best.as_ref().is_none_or(|b| fit > b.2) {
+            best = Some((text, cover, fit));
+        }
+    };
+    for l in near {
+        consider(l.text.clone(), l.skel.clone());
+    }
+    for a in near {
+        for b in near {
+            let (ca, cb) = ((a.bbox[1] + a.bbox[3]) / 2.0, (b.bbox[1] + b.bbox[3]) / 2.0);
+            if a.bbox[0] < b.bbox[0] && (ca - cb).abs() < 12.0 {
+                consider(format!("{} {}", a.text, b.text), format!("{}{}", a.skel, b.skel));
+            }
+        }
+    }
+    best.map(|(t, cover, _)| (t, cover))
+}
+
 /// The copy of the page: the blank's print where it lies on the scan, and the student's
 /// writing as Datalab read it, each piece boxed by its ink.
 fn assemble(p: &Page, bp: &BlankPage, fit: Fit, found: &[(String, [f32; 4], String)], ink: &[bool], w: u32, h: u32) -> Rebuild {
@@ -662,8 +799,18 @@ fn assemble(p: &Page, bp: &BlankPage, fit: Fit, found: &[(String, [f32; 4], Stri
             let sk = item_skel(it);
             let text = item_text(it);
             let caption = is_figure(kind) && ["plot:", "chart:", "graph:"].iter().any(|c| text.contains(c));
-            if printed(&sk, &near) || caption {
+            // A printed line with blanks the student filled in: only what was written in.
+            let print = if matches!(it, Item::Line(_)) && !caption { best_print(&sk, &near) } else { None };
+            let fill = print.as_ref().filter(|(_, cover)| *cover >= 0.8).and_then(|(p, _)| filled(&text, p));
+            if std::env::var_os("DOCUMENTASHION_READ_DEBUG").is_some() {
+                eprintln!("line {:?}\n  near {:?}\n  print {:?}\n  fill {:?}", text, near.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), print, fill);
+            }
+            if printed(&sk, &near) || caption || fill.is_some() {
                 work(&mut lines, is_figure(kind), &mut blocks, &mut covered);
+                if let Some(f) = fill {
+                    lines.push((f, row(*b, i, n)));
+                    work(&mut lines, false, &mut blocks, &mut covered);
+                }
                 continue;
             }
             lines.push((text, row(*b, i, n)));
@@ -755,6 +902,20 @@ mod tests {
         // Boxed by its ink, not by the block.
         assert!((hand[0].bbox[0] - 75.0).abs() < 1.0 && (hand[0].bbox[1] - 125.0).abs() < 1.0, "{:?}", hand[0].bbox);
         assert_eq!(r.blocks.iter().filter(|b| !b.handwritten).count(), 3);
+    }
+
+    #[test]
+    fn only_what_was_written_into_a_printed_line_is_the_students() {
+        let p = "Choose x-values. ________ each x into the equation. Compute y. Write the ordered pairs, then ________ and draw the line.";
+        let r = "Choose x-values. plug each x into the equation. Compute y. Write the ordered pairs, then and draw the line.";
+        assert_eq!(filled(r, p).as_deref(), Some("plug"));
+        let p = "Try $x = -3, 0, 3$: y = ______.";
+        assert_eq!(filled("Try $x = -3, 0, 3$: $y = \\frac{2}{3}(-3) + 1$.", p).as_deref(), Some("$\\frac{2}{3}(-3) + 1$"));
+        // A blank drawn as space and left empty adds nothing; nor does the print misread.
+        assert_eq!(filled("For $2x + 3y = 3$: $y = \\underline{\\hspace{2cm}}$.", "For $2x + 3y = 3$: y = ______."), None);
+        assert_eq!(filled("When x increase by 1, y changes", "When x increases by 1, y changes"), None);
+        assert_eq!(filled("When x increases by 1, y changes by the difference. Compare", "When x increases by 1, y changes by the ______. Compare").as_deref(), Some("difference"));
+        assert_eq!(student::skeleton("y = \\underline{\\hspace{2cm}}"), "y=");
     }
 
     #[test]
