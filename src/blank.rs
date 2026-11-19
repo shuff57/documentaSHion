@@ -883,7 +883,8 @@ fn tag(img: &mut RgbImage, n: usize, [x0, y0, x1, y1]: [f32; 4]) {
 /// What two readings have in common, for telling whether they agree: [`student::skeleton`]
 /// without the line breaks and fraction bars that readers write differently.
 fn agree(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.replace(" / ", "\n");
+    // A line read as nothing but "[unclear]" is no opinion on it.
+    let norm = |s: &str| s.replace(" / ", "\n").lines().filter(|l| l.trim() != "[unclear]").collect::<Vec<_>>().join("\n");
     let (a, b) = (norm(a), norm(b));
     // Writing read two ways ("0 or 1") is a doubt, never agreement.
     if [&a, &b].iter().any(|s| s.contains(" or ")) && !(a.contains(" or ") && b.contains(" or ")) {
@@ -891,7 +892,8 @@ fn agree(a: &str, b: &str) -> bool {
     }
     // A circled answer is read as one in brackets by one reader and bare by the other.
     let sk = |s: &str| {
-        let k = student::skeleton(s).replace(['/', ','], "");
+        // A table's rules ("| x | 3") are the reader's, not the student's.
+        let k = student::skeleton(s).replace(['/', ',', '|'], "");
         match k.strip_prefix('(').and_then(|k| k.strip_suffix(')')) {
             Some(inner) if !inner.contains(['(', ')']) => inner.to_string(),
             _ => k,
@@ -932,6 +934,37 @@ fn agree(a: &str, b: &str) -> bool {
     let fraction = a.contains("\\frac") || b.contains("\\frac") || last_a.contains('/') || last_b.contains('/');
     let ends = !(answer(&a) || answer(&b)) || last_a == last_b || (fraction && sorted(&last_a) == sorted(&last_b)) || all_a.contains(&last_b) || all_b.contains(&last_a);
     within && ends
+}
+
+/// The reply's list of boxes: the last `{"boxes": …}` object in it that reads, since a model
+/// sometimes sends a bad one and then a correction.
+fn boxes_reply(reply: &str) -> Option<Value> {
+    let starts: Vec<usize> = reply.match_indices('{').map(|(i, _)| i).filter(|&i| reply[i + 1..].trim_start().starts_with("\"boxes\"")).collect();
+    starts.iter().rev().find_map(|&i| {
+        let read = |s: &str| serde_json::Deserializer::from_str(s).into_iter::<Value>().next().and_then(Result::ok);
+        read(&reply[i..]).or_else(|| read(&lenient(&reply[i..]))).filter(|v| v.get("boxes").is_some_and(Value::is_array))
+    })
+}
+
+/// JSON with LaTeX's backslashes left bare (`"$2 \cdot 3$"`): each backslash escaped, except
+/// one already escaping a backslash or a quote.
+fn lenient(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.peek() {
+                Some('\\') | Some('"') => {
+                    out.push(c);
+                    out.push(it.next().unwrap_or_default());
+                }
+                _ => out.push_str("\\\\"),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 const SECOND_PROMPT: &str = r#"A student's worksheet page is attached. Pieces of the student's handwriting are outlined in red, each numbered on a red tag.
@@ -986,9 +1019,11 @@ pub fn second_read(sent: &GrayImage, r: &mut Rebuild, s: &Settings, api: &str) -
     }
     let prompt = SECOND_PROMPT.replace("{CONTEXT}", &context.join("\n"));
     let reply = crate::services::chat(s, api, &prompt, &b64, true, std::time::Duration::from_secs(300))?;
+    if let Some(dir) = std::env::var_os("DOCUMENTASHION_READ_DEBUG") {
+        let _ = std::fs::write(std::path::PathBuf::from(dir).join("second.txt"), &reply);
+    }
     let bad = || "The second reading wasn't a list of boxes.".to_string();
-    let (a, b) = (reply.find('{').ok_or_else(bad)?, reply.rfind('}').ok_or_else(bad)?);
-    let v: Value = serde_json::from_str(reply.get(a..=b).ok_or_else(bad)?).map_err(|_| bad())?;
+    let v = boxes_reply(&reply).ok_or_else(bad)?;
     let mut differ = 0;
     for item in v.get("boxes").and_then(Value::as_array).ok_or_else(bad)? {
         let n = item.get("n").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0) as usize;
@@ -1171,6 +1206,19 @@ mod tests {
         // Working split into lines differently still agrees; a different answer doesn't.
         assert!(agree("$4x + 6x - 15 = 45$\n$10x - 15 = 45$\n$+15 +15$\n$\\frac{10x}{10} = \\frac{60}{10}$", "$4x + 6x - 15 = 45$ / $10x - 15 = 45$ / $+15 \\quad +15$ / $10x = 60$ / $10 \\quad 10$"));
         assert!(!agree("$30 + 12x = 9$\n$12x = -21$\n$x = \\frac{7}{4}$", "$30 + 12x = 9$ / $12x = -21$ / $x = \\frac{-7}{4}$"));
+        // LaTeX left unescaped in the reply still reads.
+        let v: Value = serde_json::from_str(&lenient(r#"{"boxes":[{"n":1,"text":"$2 \cdot 3$ \"6\" \\ ok"}]}"#)).unwrap();
+        assert_eq!(v["boxes"][0]["text"], "$2 \\cdot 3$ \"6\" \\ ok");
+        // A bad reply, then its correction: the correction counts.
+        let v = boxes_reply("{\"boxes\":[{\"n\":1,\"text\":\"a\",\"text\":\"a\"}]}\n\nCorrection:\n\n{\"boxes\":[{\"n\":1,\"text\":\"b\"}]}").unwrap();
+        assert_eq!(v["boxes"][0]["text"], "b");
+        assert_eq!(boxes_reply("Here: {\"boxes\":[{\"n\":2,\"text\":\"$x \\cdot 2$\"}]} done").unwrap()["boxes"][0]["n"], 2);
+        // A table read as rows by one reader and cell by cell by the other; a trailing
+        // "[unclear]" is no opinion.
+        assert!(agree(
+            " | $x$ | 3\n$2x$ | $2x^2$ | $6x$\n6 | $6x$ | 18\n$(x+3)(2x+6) = 2x^2 + 6x + 6x + 18$\n$= 2x^2 + 12x + 18$",
+            "x / 3 / 2x / 6 / $2x^2$ / $6x$ / $6x$ / 18 / $(x+3)(2x+6) = 2x^2 + 6x + 6x + 18$ / $2x^2 + 12x + 18$ / [unclear]"
+        ));
     }
 
     #[test]

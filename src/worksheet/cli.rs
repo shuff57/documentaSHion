@@ -15,7 +15,9 @@
 //! documentashion ws read    <blank.png[,blank2.png]> <scan.png> <out.json> [--dpi N] [--dry-run]
 //!                           [--key key.txt] [--check]  the student's writing read against a blank copy
 //!                                                 (`--dry-run`: the page as it would be sent, as out.png;
-//!                                                 `--key`: marked against it by Claude too)
+//!                                                 `--key`: marked against it by Claude too;
+//!                                                 scan as `<project id>:<page n>`: the page as the app has it;
+//!                                                 `--save-blank b.json`: the blank as read, for a project)
 //! documentashion ws upright <scan.png> <out.png>                       turn the page the right way up
 //! documentashion ws page    <project id> <page n> [out.docx]            a project's page, as the app does it
 //! documentashion ws rebuild <scan.png> <out.docx> [--model opus]      all of it: upright, extract, fit, build
@@ -97,7 +99,18 @@ pub fn main(args: &[String]) -> Result<(), String> {
                 eprintln!("blank {b}: {} printed lines, {} name line(s)", bp.lines.len(), bp.names.len());
                 blank.pages.push(bp);
             }
-            let p = page(arg(2)?);
+            if let Some(out) = flag("--save-blank") {
+                std::fs::write(&out, serde_json::to_vec(&blank).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"))?;
+            }
+            // "<project id>:<page>": the page as the app has it, straightened and cropped.
+            let p = match arg(2)?.split_once(':') {
+                Some((id, n)) if n.parse::<usize>().is_ok() => {
+                    let dir = crate::model::root().join("projects").join(id);
+                    let project: crate::model::Project = serde_json::from_slice(&std::fs::read(dir.join("project.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                    project.pages.get(n.parse::<usize>().unwrap_or(0).saturating_sub(1)).cloned().ok_or("No such page.")?
+                }
+                _ => page(arg(2)?),
+            };
             if args.iter().any(|a| a == "--dry-run") {
                 let (_, sent, i, fit) = crate::blank::outgoing(&p, &blank)?;
                 eprintln!("blank page {} · scale {:.3} · shift {:.0}, {:.0} · {:.0}% alike", i + 1, fit.s, fit.dx, fit.dy, fit.score * 100.0);
